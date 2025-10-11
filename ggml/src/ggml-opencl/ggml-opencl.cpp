@@ -57,6 +57,7 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
 enum GPU_FAMILY {
     ADRENO,
     INTEL,
+    KYLIN,
     UNKNOWN,
 };
 
@@ -2217,6 +2218,7 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
     return found_devices;
 }
 
+
 // Initialize device if it is supported (returns nullptr if it is not).
 static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     GGML_ASSERT(dev);
@@ -2239,7 +2241,7 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     // to increase ref_count for each call. We only want to increase ref_count
     // when the associated device is initialized
     backend_ctx->ref_count  = 0;
-
+    auto dev_name = dev_ctx->device_name.c_str();
     if (strstr(dev_ctx->device_name.c_str(), "Adreno") ||
         strstr(dev_ctx->device_name.c_str(), "Qualcomm") ||
         strstr(dev_ctx->device_version.c_str(), "Adreno")) {
@@ -2254,6 +2256,11 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
         backend_ctx->adreno_wave_size = 64;
     } else if (strstr(dev_ctx->device_name.c_str(), "Intel")) {
         backend_ctx->gpu_family = GPU_FAMILY::INTEL;
+    } else if (strstr(dev_ctx->device_name.c_str(), "NVIDIA") || 
+               strstr(dev_ctx->device_name.c_str(), "Arise")) {
+        backend_ctx->gpu_family = GPU_FAMILY::INTEL;
+        // backend_ctx->gpu_family = GPU_FAMILY::KYLIN;
+        GGML_LOG_INFO("ggml_opencl: support Kylin gpu family : %s\n", dev_ctx->device_name.c_str());
     } else {
         GGML_LOG_ERROR("Unsupported GPU: %s\n", dev_ctx->device_name.c_str());
         backend_ctx->gpu_family = GPU_FAMILY::UNKNOWN;
