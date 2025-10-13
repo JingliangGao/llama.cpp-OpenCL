@@ -684,9 +684,17 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
     // compiler options for general kernels
     auto opencl_c_std =
         std::string("CL") + std::to_string(opencl_c_version.major) + "." + std::to_string(opencl_c_version.minor);
+#ifdef GGML_OPENCL_USE_KYLIN_KERNELS
+    std::string compile_opts = std::string("-cl-std=") + opencl_c_std +
+                               " -cl-mad-enable -cl-unsafe-math-optimizations"
+                               " -cl-finite-math-only -cl-fast-relaxed-math"
+                               " -DKYLIN_GPU";
+#else
     std::string compile_opts = std::string("-cl-std=") + opencl_c_std +
                                " -cl-mad-enable -cl-unsafe-math-optimizations"
                                " -cl-finite-math-only -cl-fast-relaxed-math";
+#endif
+    
 
     GGML_LOG_INFO("ggml_opencl: loading OpenCL kernels");
 
@@ -1473,8 +1481,16 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("div.cl");
 #endif
-        std::string compile_opts = std::string("-cl-std=") + opencl_c_std +
+
+#ifdef GGML_OPENCL_USE_KYLIN_KERNELS
+    std::string compile_opts = std::string("-cl-std=") + opencl_c_std +
+                               " -cl-mad-enable -cl-finite-math-only "
+                               " -DKYLIN_GPU";
+#else
+    std::string compile_opts = std::string("-cl-std=") + opencl_c_std +
                                " -cl-mad-enable -cl-finite-math-only ";
+#endif
+        
 
         backend_ctx->program_div =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
