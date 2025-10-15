@@ -593,7 +593,7 @@ struct ggml_backend_opencl_context {
 
         cl_int err = clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL);
         if (err == CL_INVALID_WORK_GROUP_SIZE) {
-            fprintf(stderr, "CL_INVALID_WORK_GROUP_SIZE, retrying with work_dim=1/local=NULL\n");
+            // fprintf(stderr, "CL_INVALID_WORK_GROUP_SIZE, retrying with work_dim=1/local=NULL\n");
             err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, global_work_size, NULL, 0, NULL, NULL);
         }
         GGML_ASSERT(err == CL_SUCCESS);
