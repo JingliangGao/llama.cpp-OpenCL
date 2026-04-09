@@ -346,108 +346,54 @@ extern "C" void ggml_graph_profile_event(const struct ggml_cgraph *cg, enum ggml
 }
 
 
-/* func: cache all functions {'pointer' : name} */
+/* struct: cache all functions {'pointer' : name} */
 typedef struct {
     void *addr;
     const char *name;
 } cache_entry;
 
-/* func: cache ggml-/llama- functions {'pointer' : start_time} */
+/* struct: cache ggml-/llama- functions {'pointer' : start_time} */
 typedef struct {
     void *fn;
     uint64_t start_time;
+    const char *name;
 } stack_entry;
 
+constexpr int STACK_SIZE = int(CACHE_SIZE * 0.25);
 static cache_entry g_cache[CACHE_SIZE];                 /* SIZE = 16 Byte * CACHE_SIZE */
-static stack_entry g_stack[int(CACHE_SIZE * 0.25)];     /* SIZE = 16 Byte * (CACHE_SIZE * 0.25) */
+static stack_entry g_stack[STACK_SIZE];                 /* SIZE = 16 Byte * (CACHE_SIZE * 0.25) */
 static int g_stack_top = 0;
 static int g_cache_count = 0;
 
-/* linear search */
-__attribute__((no_instrument_function))
-static const char *lookup_symbol(void *fn) {
-    for (int i = 0; i < g_cache_count; i++) {
-        if (g_cache[i].addr == fn) {
-            return g_cache[i].name;
-        }
-    }
-    return NULL;
-}
-
-// static inline uint32_t hash_ptr(void *p) {
-//     uintptr_t x = (uintptr_t)p;
-//     x ^= x >> 33;
-//     x *= 0xff51afd7ed558ccdULL;
-//     x ^= x >> 33;
-//     return (uint32_t)x;
-// }
-
-// __attribute__((no_instrument_function))
-// static const char *lookup_symbol(void *fn) {
-//     uint32_t idx = hash_ptr(fn) & (CACHE_SIZE - 1);
-
-//     if (g_cache[idx].addr == fn) {
-//         return g_cache[idx].name;
-//     }
-
-//     return NULL; // 冲突 or 未命中
-// }
-
-// __attribute__((no_instrument_function))
-// static void insert_symbol(void *fn, const char *name) {
-//     uint32_t idx = hash_ptr(fn) & (CACHE_SIZE - 1);
-
-//     g_cache[idx].addr = fn;
-//     g_cache[idx].name = name;
-// }
-
-__attribute__((no_instrument_function))
-static const char *demangle(const char *name) {
-    int status = 0;
-    char *demangled = abi::__cxa_demangle(name, NULL, NULL, &status);
-
-    if (status == 0 && demangled) {
-        return demangled;
-    }
-
-    return name;
-}
 
 __attribute__((no_instrument_function))
 static const char *resolve_symbol(void *fn) {
-    // auto t_start = std::chrono::high_resolution_clock::now();
-    const char *name = lookup_symbol(fn);
-    if (name) {
-        // auto t_check = std::chrono::high_resolution_clock::now();
-        // auto check_duration = std::chrono::duration_cast<std::chrono::microseconds>(t_check - t_start).count();
-        // if (check_duration > 10) {
-        //     fprintf(stderr, "ggml-profile: symbol lookup took %lld us for function name %s with pointer %p\n", (long long)check_duration, name, fn);
-        // }
-        return name;
+
+    /* linear search  */
+    for (int i = 0; i < g_cache_count; i++) {
+        if (g_cache[i].addr == fn) {
+            return g_cache[i].name; }
     }
 
+    /* parse name from address */
     Dl_info info;
     if (dladdr(fn, &info) && info.dli_sname) {
         const char *final_name = info.dli_sname;
 
-        // demangle
+        /* demangle */
         char *demangled = abi::__cxa_demangle(info.dli_sname, NULL, NULL, NULL);
         if (demangled) {
             final_name = demangled;
         }
 
+        /* cache 'addr : name' */
         if (g_cache_count < CACHE_SIZE) {
             g_cache[g_cache_count].addr = fn;
             g_cache[g_cache_count].name = final_name;
             g_cache_count++;
         }
-        // insert_symbol(fn, final_name);
-        // auto t_resolve = std::chrono::high_resolution_clock::now();
-        // auto resolve_duration = std::chrono::duration_cast<std::chrono::microseconds>(t_resolve - t_start).count();
-        // if (resolve_duration > 100) {
-        //     fprintf(stderr, "ggml-profile: symbol resolution took %lld us for function name %s with pointer %p\n", (long long)resolve_duration, final_name, fn);
-        // }
 
+        /* only collect ggml/llama functions */
         if (strstr(final_name, "ggml") ||
             strstr(final_name, "llama")) {
             return final_name;
@@ -462,13 +408,15 @@ extern "C" __attribute__((no_instrument_function))
 void __cyg_profile_func_enter(void *this_fn, void *call_site) {
     (void)call_site;
 
+    /* parse func name from pointer */
     const char *name = resolve_symbol(this_fn);
     if (!name) return;
 
     /* push {'pointer' : start_time} into stack */
-    if (g_stack_top < int(CACHE_SIZE * 0.25)) {
+    if (g_stack_top < STACK_SIZE) {
         g_stack[g_stack_top].fn = this_fn;
         g_stack[g_stack_top].start_time = get_time_ns();
+        g_stack[g_stack_top].name = name;
         g_stack_top++;
     }
 
@@ -478,24 +426,22 @@ extern "C" __attribute__((no_instrument_function))
 void __cyg_profile_func_exit(void *this_fn, void *call_site) {
     (void)call_site;
 
-    // parse func name from pointer
-    const char *name = resolve_symbol(this_fn);
-    if (!name) return;
-
+    /* pop {'pointer' : start_time} from stack */
     if (g_stack_top <= 0) return;
+    stack_entry *entry = &g_stack[g_stack_top - 1];
+    if (entry->fn != this_fn) { return; }
     g_stack_top--;
-    stack_entry *entry = &g_stack[g_stack_top];
 
+    /* get stack entry */
     uint64_t end = get_time_ns();
     uint64_t duration = end - entry->start_time;
     uint64_t pid = GetPid();
     uint64_t tid = GetTid();
     uint64_t time_stamp = transToRelativeTime(entry->start_time);
 
-    // create JSON string
+    /* create JSON string */
     std::string output_buffer;
     char buf[512];
-
     int len = snprintf(
         buf, sizeof(buf),
         "\n{\n"
@@ -506,7 +452,7 @@ void __cyg_profile_func_exit(void *this_fn, void *call_site) {
         "  }\n"
         "},",
         "call_stack",
-        name,
+        entry->name,
         (unsigned long long)(0),
         (unsigned long long)(tid),
         (unsigned long long)(time_stamp / 1000),
@@ -516,7 +462,7 @@ void __cyg_profile_func_exit(void *this_fn, void *call_site) {
         (unsigned long long)(pid), (unsigned long long)(tid)
     );
 
-    // add into global buffer
+    /* add into global buffer */
     global_profile_buffer.append(buf, len);
 }
 
