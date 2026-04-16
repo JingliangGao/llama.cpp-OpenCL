@@ -24,6 +24,7 @@ fi
 # install dependencies
 echo ">> [INFO] Installing dependencies ... "
 ${SUDO_ER} apt install libcurl4-openssl-dev
+${SUDO_ER} apt install -y gdb
 
 # build project
 echo ">> [INFO] Building project  ... "
