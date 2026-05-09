@@ -44,4 +44,8 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    // MoE override params     JingliangGao 2025/06/08
+    int32_t  n_layer_skip;      // skip number of MoE layers
+    int32_t  n_expert_override; // override number of experts for MoE layers
 };

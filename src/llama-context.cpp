@@ -168,6 +168,10 @@ llama_context::llama_context(
     // initialized later
     cparams.pipeline_parallel = false;
 
+    // MoE override params     JingliangGao 2025/06/08
+    cparams.n_layer_skip = params.n_layer_skip;
+    cparams.n_expert_override = params.n_expert_override;
+
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
@@ -3212,6 +3216,9 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
+        /*.yarn_orig_ctx               =*/ 0,
+        /*.n_expert_override           =*/ 0,
+        /*.n_layer_skip                =*/ 0 // 0 = compute all layers
     };
 
     return result;

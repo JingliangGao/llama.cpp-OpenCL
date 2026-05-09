@@ -122,7 +122,13 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    // for models with n_layer_skip, we still need to compute the skipped layers to
+    // get the correct input for the output norm and head, but we won't compute the output of those layers,
+    // so we can save some memory and computation by not storing the intermediate tensors for those layers      JingliangGao 2025/06/08
+    const int64_t n_layer_skip = cparams.n_layer_skip;
+    const int64_t n_layer_use = (n_layer_skip > 0 && n_layer_skip < n_layer) ? n_layer - n_layer_skip : n_layer;
+
+    for (int il = 0; il < n_layer_use; ++il) {
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -168,7 +174,9 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(cur, "attn_out", il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+
+        // deal with the last used layer   JingliangGao 2025/06/08
+        if (il == n_layer_use - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }

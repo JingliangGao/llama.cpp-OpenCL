@@ -24,7 +24,13 @@ void llama_model_qwen3moe::load_arch_tensors(llama_model_loader &) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
     }
 
-    for (int i = 0; i < n_layer; ++i) {
+    // QWen3MoE model: for models with n_layer_skip, we still need to load the skipped layers to
+    // get the correct input for the output norm and head, but we won't compute the output of those layers,
+    // so we can save some memory by not loading the intermediate tensors for those layers      JingliangGao 2025/06/08
+    const int64_t n_layer_skip = cparams.n_layer_skip;
+    const int64_t n_layer_use = (n_layer_skip > 0 && n_layer_skip < n_layer) ? n_layer - n_layer_skip : n_layer;
+
+    for (int i = 0; i < n_layer_use; ++i) {
         auto & layer = layers[i];
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);

@@ -1471,6 +1471,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
+    // Expert override     JingliangGao 2026/06/11
+    int32_t n_expert_exec = n_expert_used;  // Default: execute all selected experts
+    if (cparams.n_expert_override > 0 && cparams.n_expert_override < n_expert_used) {
+        n_expert_exec = cparams.n_expert_override;
+
+        // Slice selected_experts from [n_expert_used, n_tokens] to [n_expert_exec, n_tokens]
+        // This causes ggml_mul_mat_id to only load and compute the first n_expert_exec experts
+        selected_experts = ggml_view_2d(ctx0, selected_experts, n_expert_exec, n_tokens,
+                                        selected_experts->nb[1], 0);
+        // Make contiguous for subsequent operations
+        selected_experts = ggml_cont(ctx0, selected_experts);
+        cb(selected_experts, "ffn_moe_topk_sliced", il);
+
+        // Slice weights from [1, n_expert_used, n_tokens] to [1, n_expert_exec, n_tokens]
+        weights = ggml_view_3d(ctx0, weights, 1, n_expert_exec, n_tokens,
+                               weights->nb[1], weights->nb[2], 0);
+        // Make contiguous for subsequent reshape operations
+        weights = ggml_cont(ctx0, weights);
+        cb(weights, "ffn_moe_weights_sliced", il);
+    }
 
     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);

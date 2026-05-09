@@ -4082,6 +4082,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
+    //
+    // MOE expert override params
+    //
+
+    /* skip n-layer computation    JingliangGao 2026/06/08 */
+    add_opt(common_arg(
+        {"--n-layer-skip"}, "N",
+        string_format("skip N layers (default: %d, 0 = compute all layers)\n"
+            "for layer freeze computation ", params.n_layer_skip),
+        [](common_params & params, int value) {
+            params.n_layer_skip = value;
+        }
+    ).set_env("LLAMA_ARG_N_LAYER_SKIP"));
+
+    /* override moe n-expert   JingliangGao 2026/06/08 */
+    add_opt(common_arg(
+        {"--n-expert-override"}, "N",
+        string_format("MoE: override N active experts (default: %d = model default)\n"
+                      "for MoE self-draft speculation", params.n_expert_override),
+        [](common_params & params, int value) {
+            params.n_expert_override = value;
+        }
+    ).set_env("LLAMA_ARG_N_EXPERT_OVERRIDE"));
+
+
     return ctx_arg;
 }
 

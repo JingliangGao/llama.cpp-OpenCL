@@ -438,6 +438,10 @@ struct common_params {
     float   yarn_beta_slow        = -1.0f; // YaRN high correction dim
     int32_t yarn_orig_ctx         =     0; // YaRN original context length
 
+    // MoE override params     JingliangGao 2025/06/08
+    int32_t n_layer_skip      = 0; // skip N layers to freeze computation (0 = no layers skipped, > 0 number of layers to skip from the bottom)
+    int32_t n_expert_override = 0; // override n_expert_used (0 = use model default)
+
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 

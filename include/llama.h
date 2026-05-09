@@ -380,6 +380,11 @@ extern "C" {
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
+
+        // [EXPERIMENTAL]
+        // MoE override params     JingliangGao 2025/06/08
+        int32_t n_layer_skip;      // skip N layers to freeze computation (0 = no layers skipped, > 0 number of layers to skip from the bottom)
+        int32_t n_expert_override; // override n_expert_used (0 = use model default)
     };
 
     struct llama_model_tensor_override {
