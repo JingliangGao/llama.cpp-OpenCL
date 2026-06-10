@@ -70,7 +70,7 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
 
     // QWen2 model : for models with n_layer_skip, we still need to compute the skipped layers to
     // get the correct input for the output norm and head, but we won't compute the output of those layers,
-    // so we can save some memory and computation by not storing the intermediate tensors for those layers      JingliangGao 2025/06/08
+    // so we can save some memory and computation by not storing the intermediate tensors for those layers      JingliangGao 2026/06/08
     const int64_t n_layer_skip = cparams.n_layer_skip;
     const int64_t n_layer_use = (n_layer_skip > 0 && n_layer_skip < n_layer) ? n_layer - n_layer_skip : n_layer;
 
@@ -109,8 +109,8 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
-        
-        // deal with the last used layer   JingliangGao 2025/06/08
+
+        // deal with the last used layer   JingliangGao 2026/06/08
         if (il == n_layer_use - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);

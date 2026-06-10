@@ -3391,7 +3391,6 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
-        /*.yarn_orig_ctx               =*/ 0,
         /*.n_expert_override           =*/ 0,
         /*.n_layer_skip                =*/ 0 // 0 = compute all layers
     };

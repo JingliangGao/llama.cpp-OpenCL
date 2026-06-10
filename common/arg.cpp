@@ -4173,14 +4173,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     /* override moe n-expert   JingliangGao 2026/06/08 */
     add_opt(common_arg(
-        {"--n-expert-override"}, "N",
-        string_format("MoE: override N active experts (default: %d = model default)\n"
-                      "for MoE self-draft speculation", params.n_expert_override),
+        {"-om", "--override-moe"}, "N",
+        string_format("override N active experts (default: %d = model default)\n"
+                      "for MoE structure", params.n_expert_override),
         [](common_params & params, int value) {
             params.n_expert_override = value;
         }
     ).set_env("LLAMA_ARG_N_EXPERT_OVERRIDE"));
-
 
     return ctx_arg;
 }
