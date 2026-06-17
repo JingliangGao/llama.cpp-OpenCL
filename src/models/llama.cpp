@@ -130,6 +130,8 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     const int64_t n_layer_use = (n_layer_skip > 0 && n_layer_skip < n_layer) ? n_layer - n_layer_skip : n_layer;
 
     for (int il = 0; il < n_layer_use; ++il) {
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
 
         // norm

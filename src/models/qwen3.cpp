@@ -74,6 +74,8 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     const int64_t n_layer_skip = cparams.n_layer_skip;
     const int64_t n_layer_use = (n_layer_skip > 0 && n_layer_skip < n_layer) ? n_layer - n_layer_skip : n_layer;
     for (int il = 0; il < n_layer_use; ++il) {
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
 
         // norm
