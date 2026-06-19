@@ -81,7 +81,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     // get the correct input for the output norm and head, but we won't compute the output of those layers,
     // so we can save some memory by not loading the intermediate tensors for those layers      JingliangGao 2026/06/08
     const int64_t n_layer_skip = cparams.n_layer_skip;
-    const int64_t n_layer_use  = (n_layer_skip > 0 && n_layer_skip < n_layer) ? n_layer_skip : n_layer;
+    const int64_t n_layer_use  = (n_layer_skip > 0 && n_layer_skip < n_layer) ? n_layer - n_layer_skip : n_layer;
 
     for (int il = 0; il < n_layer_use; ++il) {
         res->t_layer_inp[il] = inpL;

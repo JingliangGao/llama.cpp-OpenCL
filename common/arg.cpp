@@ -4170,7 +4170,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     /* skip n-layer computation    JingliangGao 2026/06/08 */
     add_opt(common_arg(
-        {"--n-layer-skip"}, "N",
+        {"-nls", "--n-layer-skip"}, "N",
         string_format("skip N layers (default: %d, 0 = compute all layers)\n"
             "for layer freeze computation ", params.n_layer_skip),
         [](common_params & params, int value) {
@@ -4180,7 +4180,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     /* override moe n-expert   JingliangGao 2026/06/08 */
     add_opt(common_arg(
-        {"-om", "--override-moe"}, "N",
+        {"-oe", "--override-expert"}, "N",
         string_format("override N active experts (default: %d = model default)\n"
                       "for MoE structure", params.n_expert_override),
         [](common_params & params, int value) {

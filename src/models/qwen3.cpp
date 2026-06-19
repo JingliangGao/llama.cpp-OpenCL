@@ -73,6 +73,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     // so we can save some memory and computation by not storing the intermediate tensors for those layers      JingliangGao 2026/06/08
     const int64_t n_layer_skip = cparams.n_layer_skip;
     const int64_t n_layer_use = (n_layer_skip > 0 && n_layer_skip < n_layer) ? n_layer - n_layer_skip : n_layer;
+    
     for (int il = 0; il < n_layer_use; ++il) {
         res->t_layer_inp[il] = inpL;
 
@@ -122,7 +123,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
-        
+
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
 

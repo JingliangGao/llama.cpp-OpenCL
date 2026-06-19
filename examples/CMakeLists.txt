@@ -29,6 +29,7 @@ else()
     add_subdirectory(retrieval)
     add_subdirectory(simple)
     add_subdirectory(simple-chat)
+    add_subdirectory(simple-override-moe)    # add MoE expert override example     JingliangGao 2026/06/18  
     add_subdirectory(speculative)
     add_subdirectory(speculative-simple)
     add_subdirectory(gen-docs)
