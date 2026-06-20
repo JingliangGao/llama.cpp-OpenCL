@@ -15,95 +15,95 @@ int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
     // path to the model gguf file
-    std::string model_path = "/home/kylin/gjl/model/Qwen3-8B-GGUF/Qwen3-8B-BF16.gguf";
+    std::string model_path;
     // prompt to generate text from
-    std::string prompt = "告诉我《时间简史》的内容";
+    std::string prompt = "Hello my name is";
     // number of layers to offload to the GPU
     int ngl = 99;
     // number of tokens to predict
-    int n_predict = 200;
+    int n_predict = 32;
 
     /* MoE Override  default args     JingliangGao 2026/06/18 */
-    int n_expert_override = 2;    /* override the number of MoE experts  */
+    int n_expert_override = 1;    /* override the number of MoE experts  */
     int n_layer_skip = 0;         /* skip N layers (default: %d, 0 = compute all layers) for layer freeze computation */
 
     // parse command line arguments
 
-    // {
-    //     int i = 1;
-    //     for (; i < argc; i++) {
-    //         if (strcmp(argv[i], "-m") == 0) {
-    //             if (i + 1 < argc) {
-    //                 model_path = argv[++i];
-    //             } else {
-    //                 print_usage(argc, argv);
-    //                 return 1;
-    //             }
-    //         } else if (strcmp(argv[i], "-n") == 0) {
-    //             if (i + 1 < argc) {
-    //                 try {
-    //                     n_predict = std::stoi(argv[++i]);
-    //                 } catch (...) {
-    //                     print_usage(argc, argv);
-    //                     return 1;
-    //                 }
-    //             } else {
-    //                 print_usage(argc, argv);
-    //                 return 1;
-    //             }
-    //         } else if (strcmp(argv[i], "-ngl") == 0) {
-    //             if (i + 1 < argc) {
-    //                 try {
-    //                     ngl = std::stoi(argv[++i]);
-    //                 } catch (...) {
-    //                     print_usage(argc, argv);
-    //                     return 1;
-    //                 }
-    //             } else {
-    //                 print_usage(argc, argv);
-    //                 return 1;
-    //             }
-    //         } else if (strcmp(argv[i], "-oe") == 0) {
-    //             if (i + 1 < argc) {
-    //                 try {
-    //                     n_expert_override = std::stoi(argv[++i]);
-    //                 } catch (...) {
-    //                     print_usage(argc, argv);
-    //                     return 1;
-    //                 }
-    //             } else {
-    //                 print_usage(argc, argv);
-    //                 return 1;
-    //             }
-    //         } else if (strcmp(argv[i], "-nls") == 0) {
-    //             if (i + 1 < argc) {
-    //                 try {
-    //                     n_layer_skip = std::stoi(argv[++i]);
-    //                 } catch (...) {
-    //                     print_usage(argc, argv);
-    //                     return 1;
-    //                 }
-    //             } else {
-    //                 print_usage(argc, argv);
-    //                 return 1;
-    //             }
-    //         } else {
-    //             // prompt starts here
-    //             break;
-    //         }
-    //     }
-    //     if (model_path.empty()) {
-    //         print_usage(argc, argv);
-    //         return 1;
-    //     }
-    //     if (i < argc) {
-    //         prompt = argv[i++];
-    //         for (; i < argc; i++) {
-    //             prompt += " ";
-    //             prompt += argv[i];
-    //         }
-    //     }
-    // }
+    {
+        int i = 1;
+        for (; i < argc; i++) {
+            if (strcmp(argv[i], "-m") == 0) {
+                if (i + 1 < argc) {
+                    model_path = argv[++i];
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "-n") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        n_predict = std::stoi(argv[++i]);
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "-ngl") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        ngl = std::stoi(argv[++i]);
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "-oe") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        n_expert_override = std::stoi(argv[++i]);
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "-nls") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        n_layer_skip = std::stoi(argv[++i]);
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else {
+                // prompt starts here
+                break;
+            }
+        }
+        if (model_path.empty()) {
+            print_usage(argc, argv);
+            return 1;
+        }
+        if (i < argc) {
+            prompt = argv[i++];
+            for (; i < argc; i++) {
+                prompt += " ";
+                prompt += argv[i];
+            }
+        }
+    }
 
     // load dynamic backends
 

@@ -1615,21 +1615,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
-    /* Expert Override method    JingliangGao 2026/06/10 */
+
     int32_t n_expert_active = n_expert_used;     /* initial active experts */
+
+    /* check n_expert_override if valid */
+    if (cparams.n_expert_override >= n_expert_used || cparams.n_expert_override < 0) {
+        LLAMA_LOG_WARN("%s: invalid n_expert_override %d, should be in range [0, %d), using all experts\n",
+            __func__, cparams.n_expert_override, static_cast<int>(n_expert_used));
+    }
+
+    /* Expert Override method    JingliangGao 2026/06/10 */
     if (cparams.n_expert_override < n_expert_used && cparams.n_expert_override > 0 ) {
-        n_expert_active = cparams.n_expert_override;
+        n_expert_active = n_expert_used - cparams.n_expert_override;
 
         /* transform [n_expert_used, n_tokens] to [n_expert_active, n_tokens] */
-        selected_experts = ggml_view_2d(ctx0, selected_experts, n_expert_active, n_tokens,
-                                        selected_experts->nb[1], 0);
+        selected_experts = ggml_view_2d(ctx0, selected_experts, n_expert_active, n_tokens, selected_experts->nb[1], 0);
         /* experts must be contiguous */
         selected_experts = ggml_cont(ctx0, selected_experts);
         cb(selected_experts, "ffn_moe_topk_sliced", il);
 
         /* transform [1, n_expert_used, n_tokens] to [1, n_expert_active, n_tokens] */
-        weights = ggml_view_3d(ctx0, weights, 1, n_expert_active, n_tokens,
-                               weights->nb[1], weights->nb[2], 0);
+        weights = ggml_view_3d(ctx0, weights, 1, n_expert_active, n_tokens, weights->nb[1], weights->nb[2], 0);
         /* experts must be contiguous */
         weights = ggml_cont(ctx0, weights);
         cb(weights, "ffn_moe_weights_sliced", il);
@@ -1645,14 +1651,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (norm_w) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_active, n_tokens);
 
-        ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
+        ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights);                 // [1, n_tokens]
         cb(weights_sum, "ffn_moe_weights_sum", il);
 
         // Avoid division by zero, clamp to smallest number representable by F16
         weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
         cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
 
-        weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_active, n_tokens]
+        weights = ggml_div(ctx0, weights, weights_sum);                           // [n_expert_active, n_tokens]
         cb(weights, "ffn_moe_weights_norm", il);
 
         weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_active, n_tokens);
@@ -1662,7 +1668,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
-    //call early so that topk-moe can be used
+    // call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
@@ -1698,7 +1704,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s);               // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -1711,7 +1717,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s);       // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
