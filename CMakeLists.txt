@@ -35,6 +35,9 @@ option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)
 
 option(LLAMA_WASM_MEM64 "llama: use 64-bit memory in WASM builds" ON)
 
+# add option to support kylin system    JingliangGao 2026/05/15
+option(LLAMA_USE_KYLIN "Use in kylin system" OFF)    
+
 if (EMSCRIPTEN)
     set(BUILD_SHARED_LIBS_DEFAULT OFF)
 
@@ -241,19 +244,42 @@ set_target_properties(llama
     PROPERTIES
         PUBLIC_HEADER "${LLAMA_PUBLIC_HEADERS}")
 
-install(TARGETS llama LIBRARY PUBLIC_HEADER)
+if (LLAMA_USE_KYLIN)
+    # install the library and headers to destination    JingliangGao 2026/05/15
+    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+        set(LIB_INSTALL_PATH "/usr/lib/x86_64-linux-gnu")
+    elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+        set(LIB_INSTALL_PATH "/usr/lib/aarch64-linux-gnu")
+    endif()
+    install(TARGETS llama LIBRARY DESTINATION ${LIB_INSTALL_PATH})
+    install(TARGETS llama PUBLIC_HEADER DESTINATION include/llamacpp)
+
+else()
+    install(TARGETS llama LIBRARY PUBLIC_HEADER)
+endif()
 
 if (LLAMA_BUILD_COMMON)
     install(TARGETS llama-common LIBRARY)
 endif()
 
-configure_package_config_file(
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in
-        ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llama
-    PATH_VARS LLAMA_INCLUDE_INSTALL_DIR
-              LLAMA_LIB_INSTALL_DIR
-              LLAMA_BIN_INSTALL_DIR )
+if (LLAMA_USE_KYLIN)
+    # rename 'llama-*' -> 'llamacpp-*'     JingliangGao 2026/05/16
+    configure_package_config_file(
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in
+            ${CMAKE_CURRENT_BINARY_DIR}/llamacpp-config.cmake
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llamacpp
+        PATH_VARS LLAMA_INCLUDE_INSTALL_DIR
+                  LLAMA_LIB_INSTALL_DIR
+                  LLAMA_BIN_INSTALL_DIR )
+else()
+    configure_package_config_file(
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in
+            ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llama
+        PATH_VARS LLAMA_INCLUDE_INSTALL_DIR
+                  LLAMA_LIB_INSTALL_DIR
+                  LLAMA_BIN_INSTALL_DIR )
+endif()
 
 write_basic_package_version_file(
         ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
@@ -264,9 +290,16 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llama)
 
-configure_file(cmake/llama.pc.in
-        "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
-        @ONLY)
+if (LLAMA_USE_KYLIN)
+    # rename 'llama-*' -> 'llamacpp-*'     JingliangGao 2026/05/16
+    configure_file(cmake/llama.pc.in
+            "${CMAKE_CURRENT_BINARY_DIR}/llamacpp.pc"
+            @ONLY)
+else()
+    configure_file(cmake/llama.pc.in
+            "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
+            @ONLY)
+endif()
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)

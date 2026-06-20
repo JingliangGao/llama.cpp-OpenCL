@@ -1,0 +1,9 @@
+usr/bin
+usr/bin/*
+usr/include/llamacpp
+usr/include/llamacpp/*.h
+usr/lib/cmake/llamacpp/llamacpp-config.cmake
+usr/lib/cmake/llamacpp/llamacpp-version.cmake
+usr/lib/cmake/ggml/ggml-config.cmake
+usr/lib/cmake/ggml/ggml-version.cmake
+usr/lib/pkgconfig/llamacpp.pc

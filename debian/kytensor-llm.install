@@ -1,0 +1,7 @@
+usr/lib/*/libggml-cpu*.so
+usr/lib/*/libggml.*
+usr/lib/*/libggml-base.*
+usr/lib/*/libllama.*
+usr/lib/*/libllama-common.*
+usr/lib/*/libmtmd.*
+usr/lib/*/*.so

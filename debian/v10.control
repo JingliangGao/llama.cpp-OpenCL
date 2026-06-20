@@ -1,0 +1,33 @@
+Source: kytensor-llm
+Section: libs
+Priority: optional
+Maintainer: kylin <liuyihu@kylinos.cn>
+Build-Depends: cmake (>=3.18), tongyi-decrypt, libpciaccess-dev, debhelper-compat (= 12), gf-arise-llama-ponn (=02.00.08), ocl-icd-libopencl1
+Standards-Version: 3542
+Homepage: https://github.com/ggml-org/llama.cpp
+#Vcs-Browser: https://salsa.debian.org/debian/llama
+#Vcs-Git: https://salsa.debian.org/debian/llama.git
+
+Package: kytensor-llm
+Replaces: llamacpp
+Breaks: llamacpp
+Conflicts: llamacpp
+Section: libs
+Architecture: any
+Description: Inference of Meta's LLaMA model (and others) in pure C/C++
+ This package contains the llama.cpp core runtime libraries.
+ The main goal of llama.cpp is to enable LLM inference with minimal setup and state-of-the-art performance on a wide variety of hardware - locally and in the cloud.
+
+
+Package: kytensor-llm-dev
+Replaces: llamacpp-dev
+Breaks: llamacpp-dev
+Conflicts: llamacpp-dev
+Section: libdevel
+Architecture: any
+Depends: kytensor-llm (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}
+Description: development files for llama.cpp
+ This package contains the header files to compile applications that use llama.cpp, and contains the binary files to run llama.cpp.
+ The main goal of llama.cpp is to enable LLM inference with minimal setup and state-of-the-art performance on a wide variety of hardware - locally and in the cloud.
+
+

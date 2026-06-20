@@ -1,0 +1,88 @@
+#!/usr/bin/make -f
+# See debhelper(7) (uncomment to enable)
+# output every command that modifies files on the build system.
+#export DH_VERBOSE = 1
+
+DEB_HOST_ARCH := $(shell dpkg-architecture -qDEB_HOST_ARCH)
+
+ifeq ($(DEB_HOST_ARCH),amd64)
+    HIP_SYCL=ON
+    BACKEND_NATIVE = OFF
+    CPU_ALL_VARIANTS=ON
+    CXXFLAGS = ""
+    CFLAGS = ""
+    GCC_INSTALL_DIR_12 = /usr/lib/gcc/x86_64-linux-gnu/12
+    HIP_GCC_BIND_FLAGS = --gcc-install-dir=$(GCC_INSTALL_DIR_12)
+else
+    HIP_SYCL=OFF
+    CPU_ALL_VARIANTS=OFF
+    BACKEND_NATIVE = OFF
+    CXXFLAGS = "-mtune=native"
+    CFLAGS = "-mtune=native"
+endif
+
+# see FEATURE AREAS in dpkg-buildflags(1)
+#export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+# see ENVIRONMENT in dpkg-buildflags(1)
+# package maintainers to append CFLAGS
+#export DEB_CFLAGS_MAINT_APPEND  = -Wall -pedantic
+# package maintainers to append LDFLAGS
+#export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed
+
+
+%:
+	dh $@
+
+
+# dh_make generated override targets
+# This is example for Cmake (See https://bugs.debian.org/641051 )
+override_dh_auto_configure:
+	rm -rf build
+	mkdir -p build
+	cd build && cmake .. \
+		-DCMAKE_C_COMPILER=$(if $(filter amd64,$(DEB_HOST_ARCH)),gcc-12,$(CC)) \
+		-DCMAKE_CXX_COMPILER=$(if $(filter amd64,$(DEB_HOST_ARCH)),g++-12,$(CXX)) \
+		-DCMAKE_CXX_FLAGS=$(CXXFLAGS) \
+		-DCMAKE_C_FLAGS=$(CFLAGS) \
+		-DGGML_BACKEND_DL=ON \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DCMAKE_INSTALL_LIBDIR=/usr/lib \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DGGML_NATIVE=$(BACKEND_NATIVE) \
+		-DGGML_AVX512=OFF \
+		-DGGML_CPU_ALL_VARIANTS=$(CPU_ALL_VARIANTS) \
+
+override_dh_auto_build:
+	# cd build && make -j$(nproc)
+	cd build && make -j16
+
+override_dh_auto_test:
+	true
+
+override_dh_dwz:
+	dh_dwz -Xdebian/kytensor-llm/usr/lib/x86_64-linux-gnu/libggml-hip.so
+ifeq ($(DEB_HOST_ARCH),arm64)
+	# 在 arm64 架构下禁用 dh_dwz
+	true
+endif
+
+override_dh_auto_install:
+	rm -rf $(CURDIR)/debian/tmp
+	cd build && make install DESTDIR=$(CURDIR)/debian/tmp
+	mv $(CURDIR)/debian/tmp/usr/lib/lib*  $(CURDIR)/debian/tmp/usr/lib/*-linux-gnu/
+	mv $(CURDIR)/debian/tmp/usr/include/mtmd*  $(CURDIR)/debian/tmp/usr/include/llamacpp/
+	cp -rf $(CURDIR)/llamacpp/vendor $(CURDIR)/debian/tmp/usr/include/llamacpp/
+
+override_dh_strip:
+	dh_strip
+
+override_dh_install:
+	dh_install
+
+override_dh_shlibdeps:
+	dh_shlibdeps --dpkg-shlibdeps-params=--ignore-missing-info
+
+clean:
+	rm -rf build
+	dh_clean

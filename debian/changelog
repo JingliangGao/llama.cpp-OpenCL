@@ -1,0 +1,8 @@
+kytensor-llm (2.0.0-ok15k0.7) v11-2603-preview; urgency=medium
+
+  * BUG: 无
+  * 需求: #591921 国产cpu适配,arm cpu线程检测策略优化
+  * 其他改动说明: 无
+  * 其他改动影响域: 无
+
+ -- liuyihu <liuyihu@kylinos.cn>  Thu, 22 Jan 2026 15:08:34 +0800

@@ -47,6 +47,18 @@ if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
+# install files to destination   JingliangGao 2026/05/15
+if (LLAMA_USE_KYLIN)
+     install(
+        DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/
+        DESTINATION include/llamacpp
+        FILES_MATCHING
+        PATTERN "*.h"
+        PATTERN "*.hpp"
+        PATTERN "CMakeFiles" EXCLUDE
+    )
+endif()
+
 #
 # llama-common
 #

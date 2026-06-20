@@ -86,6 +86,17 @@
 #include "ggml-openvino.h"
 #endif
 
+/* define LIB_GGML_BACKEND_PATH for Kylin architecture   JingliangGao 2026/05/15 */
+#ifdef GGML_USE_KYLIN
+    #ifdef __x86_64__
+        #define LIB_GGML_BACKEND_PATH "/usr/lib/x86_64-linux-gnu/"
+    #elif defined(__aarch64__)
+        #define LIB_GGML_BACKEND_PATH "/usr/lib/aarch64-linux-gnu/"
+    #else
+        #error "Unsupported architecture"
+    #endif
+#endif
+
 namespace fs = std::filesystem;
 
 static std::string path_str(const fs::path & path) {
@@ -484,6 +495,10 @@ static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent,
         // default search paths: executable directory, current directory
         search_paths.push_back(get_executable_path());
         search_paths.push_back(fs::current_path());
+#ifdef GGML_USE_KYLIN
+        search_paths.push_back(LIB_GGML_BACKEND_PATH);     /* add a search path for Kylin architecture    JingliangGao 2026/05/15 */
+#endif
+
     } else {
         search_paths.push_back(fs::u8path(user_search_path));
     }
