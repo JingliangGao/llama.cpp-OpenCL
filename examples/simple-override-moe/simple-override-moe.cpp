@@ -24,7 +24,7 @@ int main(int argc, char ** argv) {
     int n_predict = 32;
 
     /* MoE Override  default args     JingliangGao 2026/06/18 */
-    int n_expert_override = 1;    /* override the number of MoE experts  */
+    int n_expert_override = 0;    /* override the number of MoE experts  */
     int n_layer_skip = 0;         /* skip N layers (default: %d, 0 = compute all layers) for layer freeze computation */
 
     // parse command line arguments
