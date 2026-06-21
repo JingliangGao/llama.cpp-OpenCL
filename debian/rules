@@ -69,10 +69,10 @@ endif
 
 override_dh_auto_install:
 	rm -rf $(CURDIR)/debian/tmp
-	cd build && make install DESTDIR=$(CURDIR)/debian/tmp
-	mv $(CURDIR)/debian/tmp/usr/lib/lib*  $(CURDIR)/debian/tmp/usr/lib/*-linux-gnu/
-	mv $(CURDIR)/debian/tmp/usr/include/mtmd*  $(CURDIR)/debian/tmp/usr/include/llamacpp/
-	cp -rf $(CURDIR)/llamacpp/vendor $(CURDIR)/debian/tmp/usr/include/llamacpp/
+	cd build && make install DESTDIR=$(CURDIR)/debian/tmp   
+# 	mv $(CURDIR)/debian/tmp/usr/lib/lib*  $(CURDIR)/debian/tmp/usr/lib/*-linux-gnu/
+# 	mv $(CURDIR)/debian/tmp/usr/include/mtmd*  $(CURDIR)/debian/tmp/usr/include/llamacpp/
+# 	cp -rf $(CURDIR)/llamacpp/vendor $(CURDIR)/debian/tmp/usr/include/llamacpp/
 
 override_dh_strip:
 	dh_strip
