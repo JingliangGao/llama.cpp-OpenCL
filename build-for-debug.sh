@@ -30,8 +30,4 @@ fi
 echo "[INFO] Building project..."
 make -j16
 
-# run exmaple
-cd ${PROJECT_DIR}
-./${BUILD_FOLDER}/bin/llama-simple-override-moe --model ${GGUF_MODEL} -oe 4 -nls 0 --prompt "你好"
-
 echo "[INFO] All done."
