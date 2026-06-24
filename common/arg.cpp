@@ -4122,6 +4122,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
+
+#ifdef LLAMA_USE_PROFILER
+    /* add profiling args    JingliangGao 2026/06/22 */
+    add_opt(common_arg(
+        {"--profile"},
+        "enable cross-backend profiling (CPU, BLAS, CUDA)",
+        [](common_params & params) {
+            params.profiling = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_DEBUG}));
+    add_opt(common_arg(
+        {"--profile-output"}, "FNAME",
+        "write profiling JSON output to FNAME (default: stdout)",
+        [](common_params & params, const std::string & value) {
+            params.profiling        = true;
+            params.profiling_output = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_DEBUG}));
+    add_opt(common_arg(
+        {"--with-backends"},
+        "export graph ops with backend assignments (default: CPU only)",
+        [](common_params & params) {
+            params.with_backends = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EXPORT_GRAPH_OPS}));
+#endif
+
     return ctx_arg;
 }
 

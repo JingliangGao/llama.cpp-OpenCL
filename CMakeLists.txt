@@ -119,6 +119,10 @@ option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 
+# profiler
+option(LLAMA_UNIFY_PROFILER "llama: enable unify profiler" OFF)    # set LLAMA option to use profiler     JingliangGao 2026/06/22
+set(GGML_UNIFY_PROFILER ${LLAMA_UNIFY_PROFILER} CACHE BOOL "" FORCE)
+
 
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)

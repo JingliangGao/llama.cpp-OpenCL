@@ -1,6 +1,10 @@
 #include "ggml-impl.h"
 #include "ggml-blas.h"
 #include "ggml-backend-impl.h"
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+#include "ggml-profiler.h"
+#include <time.h>
+#endif
 
 #include <future>
 #include <vector>
@@ -24,6 +28,12 @@ struct ggml_backend_blas_context {
     size_t work_size = 0;
 #ifndef GGML_USE_OPENMP
     std::vector<std::future<void>> tasks;
+#endif
+
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+    bool                             profiling_enabled  = false;
+    int                              profiling_split_id = 0;
+    std::vector<ggml_profile_record> profiling_records;
 #endif
 };
 
@@ -232,6 +242,15 @@ static enum ggml_status ggml_backend_blas_graph_compute(ggml_backend_t backend, 
             continue;
         }
 
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+        uint64_t prof_start_ns = 0;
+        if (ctx->profiling_enabled) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+            prof_start_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+        }
+#endif
+
         switch (node->op) {
             case GGML_OP_MUL_MAT:
                 ggml_backend_blas_mul_mat(ctx, node);
@@ -251,6 +270,25 @@ static enum ggml_status ggml_backend_blas_graph_compute(ggml_backend_t backend, 
             default:
                 GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
         }
+
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+        if (ctx->profiling_enabled) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+            uint64_t prof_end_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+
+            ggml_profile_record rec;
+            rec.type      = GGML_PROFILE_EVENT_OP;
+            rec.name      = ggml_op_name(node->op);
+            rec.split_id  = ctx->profiling_split_id;
+            rec.start_ns  = prof_start_ns;
+            rec.end_ns    = prof_end_ns;
+            rec.bytes     = ggml_nbytes(node);
+            rec.extra     = NULL;
+            ggml_profile_record_from_tensor(&rec, node);
+            ctx->profiling_records.push_back(rec);
+        }
+#endif
     }
 
     return GGML_STATUS_SUCCESS;
@@ -282,6 +320,45 @@ static ggml_guid_t ggml_backend_blas_guid(void) {
     return &guid;
 }
 
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+// BLAS backend profiler implementation
+
+static void ggml_backend_blas_profiler_enable(void * context, bool enable) {
+    ggml_backend_blas_context * ctx = (ggml_backend_blas_context *)context;
+    ctx->profiling_enabled = enable;
+}
+
+static void ggml_backend_blas_profiler_reset(void * context) {
+    ggml_backend_blas_context * ctx = (ggml_backend_blas_context *)context;
+    ctx->profiling_records.clear();
+}
+
+static void ggml_backend_blas_profiler_set_split_id(void * context, int split_id) {
+    ggml_backend_blas_context * ctx = (ggml_backend_blas_context *)context;
+    ctx->profiling_split_id = split_id;
+}
+
+static int ggml_backend_blas_profiler_get_records(void * context, const ggml_profile_record ** out) {
+    ggml_backend_blas_context * ctx = (ggml_backend_blas_context *)context;
+    *out = ctx->profiling_records.data();
+    return (int)ctx->profiling_records.size();
+}
+
+static void ggml_backend_blas_profiler_free_context(void * context) {
+    // Nothing to free - context is part of blas_ctx
+    GGML_UNUSED(context);
+}
+
+static struct ggml_backend_profiler ggml_backend_blas_profiler = {
+    /* .context        = */ NULL,
+    /* .enable         = */ ggml_backend_blas_profiler_enable,
+    /* .reset          = */ ggml_backend_blas_profiler_reset,
+    /* .set_split_id   = */ ggml_backend_blas_profiler_set_split_id,
+    /* .get_records    = */ ggml_backend_blas_profiler_get_records,
+    /* .free_context   = */ ggml_backend_blas_profiler_free_context,
+};
+#endif
+
 ggml_backend_t ggml_backend_blas_init(void) {
     ggml_backend_blas_context * ctx = new ggml_backend_blas_context;
 
@@ -291,6 +368,12 @@ ggml_backend_t ggml_backend_blas_init(void) {
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_blas_reg(), 0),
         /* .context = */ ctx,
     };
+
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+    // Set up profiler for BLAS backend
+    ggml_backend_blas_profiler.context = ctx;
+    ggml_backend_set_profiler(backend, &ggml_backend_blas_profiler);
+#endif
 
 #if defined(GGML_BLAS_USE_OPENBLAS) && defined(GGML_USE_OPENMP)
     if (openblas_get_parallel() != OPENBLAS_OPENMP) {

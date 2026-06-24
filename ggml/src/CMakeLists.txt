@@ -189,7 +189,13 @@ if (GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
     message(FATAL_ERROR "GGML_BACKEND_DL requires BUILD_SHARED_LIBS")
 endif()
 
+# set ggml  option to add profiler headers     JingliangGao 2026/06/22
+option(GGML_UNIFY_PROFILER "ggml: use profiler" OFF)
+message(STATUS "GGML_UNIFY_PROFILER: ${GGML_UNIFY_PROFILER}")
+
 add_library(ggml-base
+            $<$<BOOL:${GGML_UNIFY_PROFILER}>:../include/ggml-profiler.h>
+            $<$<BOOL:${GGML_UNIFY_PROFILER}>:ggml-profiler.cpp>
             ../include/ggml.h
             ../include/ggml-alloc.h
             ../include/ggml-backend.h

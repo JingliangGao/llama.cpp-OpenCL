@@ -8,6 +8,10 @@
 #include "ggml-impl.h"
 #include "quants.h"
 #include "ggml-threading.h"
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+#include "ggml-profiler.h"
+#include <time.h>
+#endif
 #include "unary-ops.h"
 #include "binary-ops.h"
 #include "vec.h"
@@ -3055,6 +3059,16 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+        // Per-node profiling: record timing on thread 0 only
+        uint64_t prof_start_ns = 0;
+        if (state->ith == 0 && cplan->profiling_record_fn) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+            prof_start_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+        }
+#endif
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3063,6 +3077,26 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         } else {
             ggml_compute_forward(&params, node);
         }
+
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+        if (state->ith == 0 && cplan->profiling_record_fn) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+            uint64_t prof_end_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+            uint64_t bytes = ggml_nbytes(node);
+            cplan->profiling_record_fn(
+                cplan->profiling_context,
+                (int)GGML_PROFILE_EVENT_OP,
+                ggml_op_name(node->op),
+                0, // split_id
+                prof_start_ns,
+                prof_end_ns,
+                bytes,
+                NULL, // extra
+                node
+            );
+        }
+#endif
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {

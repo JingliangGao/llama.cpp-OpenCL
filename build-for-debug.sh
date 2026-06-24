@@ -20,7 +20,8 @@ cd ${PROJECT_DIR}/${BUILD_FOLDER}
 echo "[INFO] Configuring project..."
 if [ ${BACKEND} == "cpu" ]; then
     cmake .. \
-        -DGGML_CPU=ON
+        -DGGML_CPU=ON \
+        -DLLAMA_UNIFY_PROFILER=ON
 elif [ ${BACKEND} == "cuda" ]; then
     cmake .. \
         -DGGML_CUDA=ON

@@ -59,6 +59,10 @@
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
+#if defined(LLAMA_UNIFY_PROFILER)
+#include "ggml-profiler.h"     /* insert unify profiler header here     JingliangGao 2026/06/22 */
+#endif
+
 common_time_meas::common_time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 
 common_time_meas::~common_time_meas() {
@@ -1294,6 +1298,16 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
         return;
     }
+
+#if defined(LLAMA_UNIFY_PROFILER)
+    if (params.profiling) {
+        ggml_backend_sched_t sched = llama_context_get_sched(lctx);
+        if (sched != nullptr) {
+            ggml_backend_sched_set_profiling(sched, true);
+            LOG_INF("%s: profiling enabled\n", __func__);
+        }
+    }
+#endif
 
     pimpl->context.reset(lctx);
 }

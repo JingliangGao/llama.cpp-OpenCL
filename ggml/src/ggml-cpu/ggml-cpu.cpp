@@ -187,6 +187,32 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
 
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+    // Set up profiling callback if profiling is enabled
+    if (cpu_ctx->profiling_enabled) {
+        cplan.profiling_context    = cpu_ctx;
+        cplan.profiling_record_fn  = [](void * context, int type, const char * name,
+                                        int split_id, uint64_t start_ns, uint64_t end_ns,
+                                        uint64_t bytes, const char * extra,
+                                        const struct ggml_tensor * node) {
+            struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)context;
+            ggml_profile_record rec;
+            rec.type      = (enum ggml_profile_event_type)type;
+            rec.name      = name;
+            rec.split_id  = split_id;
+            rec.start_ns  = start_ns;
+            rec.end_ns    = end_ns;
+            rec.bytes     = bytes;
+            rec.extra     = extra;
+            ggml_profile_record_from_tensor(&rec, node);
+            ctx->profiling_records.push_back(rec);
+        };
+    } else {
+        cplan.profiling_context    = NULL;
+        cplan.profiling_record_fn  = NULL;
+    }
+#endif
+
     return ggml_graph_compute(cgraph, &cplan);
 }
 

@@ -4399,11 +4399,41 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+                // Per-node profiling: record timing using CUDA events
+                if (cuda_ctx->profiling_enabled) {
+                    CUDA_CHECK(cudaEventRecord(cuda_ctx->profiling_start_event, cuda_ctx->stream()));
+                }
+#endif
+
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+                if (cuda_ctx->profiling_enabled) {
+                    CUDA_CHECK(cudaEventRecord(cuda_ctx->profiling_end_event, cuda_ctx->stream()));
+                    CUDA_CHECK(cudaEventSynchronize(cuda_ctx->profiling_end_event));
+
+                    float ms = 0.0f;
+                    CUDA_CHECK(cudaEventElapsedTime(&ms, cuda_ctx->profiling_start_event, cuda_ctx->profiling_end_event));
+
+                    ggml_profile_record rec;
+                    rec.type      = GGML_PROFILE_EVENT_OP;
+                    rec.name      = ggml_op_name(node->op);
+                    rec.split_id  = cuda_ctx->profiling_split_id;
+                    rec.start_ns  = 0;  // not used for CUDA
+                    rec.end_ns    = 0;  // not used for CUDA
+                    rec.bytes     = ggml_nbytes(node);
+                    rec.extra     = NULL;
+                    ggml_profile_record_from_tensor(&rec, node);
+                    // Store duration in end_ns field (converted to ns)
+                    rec.end_ns = (uint64_t)(ms * 1000000.0f);
+                    cuda_ctx->profiling_records.push_back(rec);
+                }
+#endif
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -5696,6 +5726,58 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     return &reg;
 }
 
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+// CUDA backend profiler implementation
+
+static void ggml_backend_cuda_profiler_enable(void * context, bool enable) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *)context;
+    ctx->profiling_enabled = enable;
+    if (enable) {
+        if (ctx->profiling_start_event == nullptr) {
+            CUDA_CHECK(cudaEventCreate(&ctx->profiling_start_event));
+            CUDA_CHECK(cudaEventCreate(&ctx->profiling_end_event));
+        }
+    }
+}
+
+static void ggml_backend_cuda_profiler_reset(void * context) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *)context;
+    ctx->profiling_records.clear();
+}
+
+static void ggml_backend_cuda_profiler_set_split_id(void * context, int split_id) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *)context;
+    ctx->profiling_split_id = split_id;
+}
+
+static int ggml_backend_cuda_profiler_get_records(void * context, const ggml_profile_record ** out) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *)context;
+    *out = ctx->profiling_records.data();
+    return (int)ctx->profiling_records.size();
+}
+
+static void ggml_backend_cuda_profiler_free_context(void * context) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *)context;
+    if (ctx->profiling_start_event != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(ctx->profiling_start_event));
+        ctx->profiling_start_event = nullptr;
+    }
+    if (ctx->profiling_end_event != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(ctx->profiling_end_event));
+        ctx->profiling_end_event = nullptr;
+    }
+}
+
+static struct ggml_backend_profiler ggml_backend_cuda_profiler = {
+    /* .context        = */ NULL,
+    /* .enable         = */ ggml_backend_cuda_profiler_enable,
+    /* .reset          = */ ggml_backend_cuda_profiler_reset,
+    /* .set_split_id   = */ ggml_backend_cuda_profiler_set_split_id,
+    /* .get_records    = */ ggml_backend_cuda_profiler_get_records,
+    /* .free_context   = */ ggml_backend_cuda_profiler_free_context,
+};
+#endif
+
 ggml_backend_t ggml_backend_cuda_init(int device) {
     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
@@ -5714,6 +5796,12 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
         /* .context = */ ctx,
     };
+
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+    // Set up profiler for CUDA backend
+    ggml_backend_cuda_profiler.context = ctx;
+    ggml_backend_set_profiler(cuda_backend, &ggml_backend_cuda_profiler);
+#endif
 
     return cuda_backend;
 }

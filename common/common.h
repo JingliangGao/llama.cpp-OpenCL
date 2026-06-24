@@ -28,6 +28,10 @@
 #define die(msg)          do { fputs("error: " msg "\n", stderr);                exit(1); } while (0)
 #define die_fmt(fmt, ...) do { fprintf(stderr, "error: " fmt "\n", __VA_ARGS__); exit(1); } while (0)
 
+#if defined(LLAMA_UNIFY_PROFILER)
+#include "ggml-profiler.h"    /* insert unify profiler header here     JingliangGao 2026/06/22 */
+#endif
+
 struct common_time_meas {
     common_time_meas(int64_t & t_acc, bool disable = false);
     ~common_time_meas();
@@ -708,6 +712,15 @@ struct common_params {
     llama_progress_callback load_progress_callback = NULL;
     void *                  load_progress_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
+
+#if defined(LLAMA_UNIFY_PROFILER)
+    /* insert unify profiler params here     JingliangGao 2026/06/22 */
+    // unify profiler params
+    bool        with_backends    = false;  // export graph ops with backend assignments
+    bool        profiling        = false;  // enable cross-backend profiling
+    std::string profiling_output = "";     // path to write profiling JSON output (empty = stdout)
+#endif
+
 };
 
 // call once at the start of a program if it uses libcommon
