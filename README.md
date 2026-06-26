@@ -3,6 +3,7 @@ branch dev-unify_profiler
 llama.cpp includes a built-in cross-backend profiler that captures per-operation timing, data transfer costs, and tensor shapes across all compute backends. It works with any application built on the ggml scheduler — no source changes needed.
 
 ## Build Project
+>>>>>>> master
 ```bash
 chmod +x build-for-debug.sh && build-for-debug.sh
 ```
