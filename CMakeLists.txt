@@ -14,6 +14,11 @@ endif()
 
 message("CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}")
 
+option(ENABLE_HOUMO_DADAO "ENABLE HOUMO_DADAO" OFF)        # JingliangGao 2026/06/26
+if (ENABLE_HOUMO_DADAO)
+    add_definitions(-DENABLE_HOUMO_DADAO)
+endif()
+
 # Add path to modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 

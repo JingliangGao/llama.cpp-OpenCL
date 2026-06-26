@@ -7,6 +7,10 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#ifdef GGML_KYLIN_SUPPORT
+#include "houmo-llmodel.h"
+#endif
+
 #include <map>
 #include <memory>
 #include <string>
@@ -589,6 +593,11 @@ struct llama_model {
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
+#ifdef GGML_KYLIN_SUPPORT
+    std::vector<std::unique_ptr<void, decltype(&std::free)>> decrypt_lora_list; // JingliangGao 2026/06/26
+    std::shared_ptr<class HouMoLLModel> hm_llmodel = nullptr;                    // HouMo NPU model instance    JingliangGao 2026/06/26
+#endif
+
     // list of devices used in this model
     std::vector<llama_device> devices;
 
@@ -649,6 +658,10 @@ struct llama_model {
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;
     virtual bool load_tensors(llama_model_loader & ml) = 0; // returns false if cancelled by progress_callback
+
+#ifdef GGML_KYLIN_SUPPORT
+    bool load_hmmodels(llama_model_loader & ml);              // JingliangGao 2026/06/26
+#endif
 
     // model must define these
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;

@@ -12,6 +12,10 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#ifdef GGML_KYLIN_SUPPORT
+#include "houmo-llmodel.h"
+#endif
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -21,6 +25,29 @@
 //
 // llama_context
 //
+
+#ifdef GGML_KYLIN_SUPPORT
+void llama_context::houmo_init(int32_t seq_max) {     // JingliangGao 2026/06/26
+    std::shared_ptr<HouMoLLModel> hm_llmodel = model.hm_llmodel;
+    hm_llmodel->houmo_init(seq_max);
+    LLAMA_LOG_INFO("%s: HMM graph init success\n", __func__);
+    cparams.n_ctx = cparams.n_ctx < hm_llmodel->n_context_length()
+                        ? cparams.n_ctx
+                        : hm_llmodel->n_context_length();
+    if (cparams.n_ubatch < 256) {
+        cparams.n_ubatch = 256;
+        cparams.n_batch = cparams.n_ubatch;
+    }
+    {
+        if (output_reserve(seq_max) < seq_max) {
+            throw std::runtime_error("failed to reserve initial output buffer");
+        }
+        LLAMA_LOG_INFO("%s: %10s  output buffer size = %8.2f MiB\n", __func__,
+                ggml_backend_buffer_name    (buf_output.get()),
+                ggml_backend_buffer_get_size(buf_output.get()) / 1024.0 / 1024.0);
+    }
+}
+#endif
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -225,6 +252,12 @@ llama_context::llama_context(
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
+
+#ifdef GGML_KYLIN_SUPPORT
+    if (hparams.is_hmm) {                            // JingliangGao 2026/06/26
+        houmo_init(cparams.n_seq_max);
+    }
+#endif
 
     if (cparams.kv_unified) {
         cparams.n_ctx_seq = cparams.n_ctx;
@@ -682,6 +715,11 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
+#ifdef GGML_KYLIN_SUPPORT
+    if (model.hparams.is_hmm) {                      // JingliangGao 2026/06/26
+        return;
+    }
+#endif
     if (!sched) {
         return;
     }
@@ -1373,6 +1411,97 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     return res;
 }
 
+#ifdef GGML_KYLIN_SUPPORT
+static std::string common_token_to_piece(const struct llama_vocab * vocab, llama_token token, bool special) {
+    std::string piece;
+    piece.resize(piece.capacity());
+    const int n_chars = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
+    if (n_chars < 0) {
+        piece.resize(-n_chars);
+        int check = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
+        GGML_ASSERT(check == -n_chars);
+    }
+    else {
+        piece.resize(n_chars);
+    }
+    return piece;
+}
+
+int llama_context::houmo_decode(const llama_batch &batch) {   // JingliangGao 2026/06/26
+    LLAMA_LOG_DEBUG("****batch.n_tokens: %d\n", batch.n_tokens);
+    std::shared_ptr<HouMoLLModel> hm_llmodel = model.hm_llmodel;
+    const int32_t n_vocab = model.vocab.n_tokens();
+    int ret = 0;
+    int n_parallel = 1;
+    std::map<int, std::vector<llama_token>> seqid_token_map;
+    std::map<int, int> seqid_pos_map;
+    int pos = 0;
+    int seq_id = 0;
+
+    if (batch.seq_id == nullptr) {
+        for (int j = 0; j < batch.n_tokens; j++) {
+            if (seqid_token_map.count(seq_id) == 0)
+                seqid_token_map[seq_id] = std::vector<llama_token>();
+            seqid_token_map[seq_id].push_back(batch.token[j]);
+        }
+        output_ids[batch.n_tokens - 1] = seq_id;
+    } else {
+        for (int j = 0; j < batch.n_tokens; j++) {
+            for (int s = 0; s < batch.n_seq_id[j]; s++) {
+                seq_id = batch.seq_id[j][s];
+                if (seqid_token_map.count(seq_id) == 0)
+                    seqid_token_map[seq_id] = std::vector<llama_token>();
+                seqid_token_map[seq_id].push_back(batch.token[j]);
+                if (batch.logits && batch.logits[j] == 1) {
+                    output_ids[j] = pos;
+                    seqid_pos_map[seq_id] = pos;
+                    pos++;
+                }
+            }
+        }
+    }
+    n_parallel = seqid_token_map.size();
+
+    int n_outputs_all = n_parallel;
+    std::vector<llama_token> decode_batches;
+    std::vector<int > seq_ids;
+
+    for (auto &[k, v] : seqid_token_map) {
+        if (v.size() == 1) {
+            decode_batches.push_back(v[0]);
+            seq_ids.push_back(k);
+        }
+    }
+    for (size_t i = 0; i < decode_batches.size();
+         i += hm_llmodel->n_decode_batch()) {
+        int n_decode_batch =
+            std::min(hm_llmodel->n_decode_batch(), (int)decode_batches.size());
+        std::vector<llama_token> decode_batch(decode_batches.begin() + i,
+                                              decode_batches.begin() + i +
+                                                  n_decode_batch);
+        std::vector<int> seq_id(seq_ids.begin() + i,
+                                seq_ids.begin() + i + n_decode_batch);
+        std::vector<float *> logits_ptrs;
+        for (auto seq : seq_id) {
+            logits_ptrs.push_back(logits + seqid_pos_map[seq] * n_vocab);
+        }
+        ret = hm_llmodel->houmo_decode(decode_batch, seq_id, logits_ptrs);
+    }
+
+    for (auto &[k, v] : seqid_token_map) {
+        if (v.size() > 1) {
+            auto logits_out = logits + seqid_pos_map[k] * n_vocab;
+            ret = hm_llmodel->houmo_prefill(v, k, logits_out);
+        }
+    }
+    n_outputs = n_outputs_all;
+    if (abort_callback && abort_callback(abort_callback_data)) {
+        return 2;
+    }
+    return ret;
+}
+#endif
+
 int llama_context::encode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -1678,6 +1807,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+#ifdef GGML_KYLIN_SUPPORT
+    if (model.hparams.is_hmm) {                      // JingliangGao 2026/06/26
+        return houmo_decode(batch_inp);
+    }
+#endif
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);

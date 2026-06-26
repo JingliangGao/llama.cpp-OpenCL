@@ -42,6 +42,11 @@ add_library(llama
             ${LLAMA_MODELS_SOURCES}
             )
 
+# HouMo NPU support    JingliangGao 2026/06/26
+target_sources(llama PRIVATE
+            houmo-llmodel.cpp
+            )
+
 set_target_properties(llama PROPERTIES
     VERSION ${LLAMA_INSTALL_VERSION}
     SOVERSION 0

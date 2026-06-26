@@ -261,6 +261,10 @@ struct llama_hparams {
     // rope_scaling_type_train is handled.
     enum llm_ffn_op_type llm_ffn_op;
 
+#ifdef GGML_KYLIN_SUPPORT
+    bool is_hmm = false;                // HouMo NPU model flag    JingliangGao 2026/06/26
+#endif
+
     // Step35: optional per-layer clamps for (Swi)GLU
     std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_exp; // clamping for expert FFN
     std::array<float, LLAMA_MAX_LAYERS> swiglu_clamp_shexp; // shared expert

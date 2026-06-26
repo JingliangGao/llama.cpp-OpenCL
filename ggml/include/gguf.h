@@ -67,6 +67,13 @@ extern "C" {
         GGUF_TYPE_COUNT,       // marks the end of the enum
     };
 
+#ifdef GGML_KYLIN_SUPPORT
+    enum gguf_decrypt_type {          // JingliangGao 2026/06/26
+        GGUF_DECRYPT_TYPE_NONE = 0,
+        GGUF_DECRYPT_TYPE_TONGYI,
+    };
+#endif
+
     struct gguf_context;
 
     struct gguf_init_params {
@@ -94,6 +101,10 @@ extern "C" {
     GGML_API uint32_t gguf_get_version    (const struct gguf_context * ctx);
     GGML_API size_t   gguf_get_alignment  (const struct gguf_context * ctx);
     GGML_API size_t   gguf_get_data_offset(const struct gguf_context * ctx);  // padded to gguf_get_alignment if and only if the gguf_context contains at least one tensor
+
+#ifdef GGML_KYLIN_SUPPORT
+    GGML_API void *   gguf_get_model_addr (const struct gguf_context * ctx);    // JingliangGao 2026/06/26
+#endif
 
     GGML_API int64_t      gguf_get_n_kv(const struct gguf_context * ctx);
     GGML_API int64_t      gguf_find_key(const struct gguf_context * ctx, const char * key); // returns -1 if key is not found

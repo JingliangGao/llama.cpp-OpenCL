@@ -493,6 +493,7 @@ endif()
 
 ggml_add_backend(BLAS)
 ggml_add_backend(CANN)
+ggml_add_backend(PONN)        # JingliangGao 2026/06/26
 ggml_add_backend(CUDA)
 ggml_add_backend(HIP)
 ggml_add_backend(METAL)

@@ -224,6 +224,11 @@ struct gguf_context {
     size_t offset    = 0; // offset of `data` from beginning of file
     size_t size      = 0; // size of `data` in bytes
 
+#ifdef GGML_KYLIN_SUPPORT
+    void * model_addr = nullptr;      // memory addr for decrypt gguf model    JingliangGao 2026/06/26
+    size_t model_size = 0;            // size of decrypt model memory            JingliangGao 2026/06/26
+#endif
+
     void * data = nullptr;
 };
 
@@ -1012,6 +1017,12 @@ size_t gguf_get_alignment(const struct gguf_context * ctx) {
 size_t gguf_get_data_offset(const struct gguf_context * ctx) {
     return ctx->offset;
 }
+
+#ifdef GGML_KYLIN_SUPPORT
+void * gguf_get_model_addr(const struct gguf_context * ctx) {      // JingliangGao 2026/06/26
+    return ctx->model_addr;
+}
+#endif
 
 int64_t gguf_get_n_kv(const struct gguf_context * ctx) {
     return ctx->kv.size();

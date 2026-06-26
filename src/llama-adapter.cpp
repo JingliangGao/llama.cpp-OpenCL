@@ -149,6 +149,13 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
 static void llama_adapter_lora_init_impl(llama_model & model, const char * path_lora, llama_adapter_lora & adapter) {
     LLAMA_LOG_INFO("%s: loading lora adapter from '%s' ...\n", __func__, path_lora);
 
+#ifdef GGML_KYLIN_SUPPORT
+    if (model.hm_llmodel != nullptr) {              // JingliangGao 2026/06/26
+        model.hm_llmodel->lora_init(std::string(path_lora), &adapter);
+        return;
+    }
+#endif
+
     ggml_context * ctx_init;
     gguf_init_params meta_gguf_params = {
         /* .no_alloc = */ true,
@@ -159,6 +166,13 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
     if (!ctx_gguf) {
         throw std::runtime_error("failed to load lora adapter file from " + std::string(path_lora));
     }
+
+#ifdef GGML_KYLIN_SUPPORT
+    void * model_addr = gguf_get_model_addr(ctx_gguf.get());      // JingliangGao 2026/06/26
+    if (model_addr != nullptr) {
+        model.decrypt_lora_list.emplace_back(model_addr, std::free);
+    }
+#endif
 
     ggml_context_ptr ctx { ctx_init };
 

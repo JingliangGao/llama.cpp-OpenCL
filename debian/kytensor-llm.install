@@ -4,4 +4,5 @@ usr/lib/*/libggml-base.*
 usr/lib/*/libllama.*
 usr/lib/*/libllama-common.*
 usr/lib/*/libmtmd.*
+usr/lib/*/libggml-ponn.so
 usr/lib/*/*.so

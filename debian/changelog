@@ -1,7 +1,25 @@
+kytensor-llm (2.0.0-ok15k0.8) v11-2603-preview; urgency=medium
+
+  * BUG: 无
+  * 需求: #591920 国产NPU适配，添加HouMo NPU支持
+  * 其他改动说明: 无
+  * 其他改动影响域: 无
+
+ -- liuyihu <liuyihu@kylinos.cn>  Thu, 22 Jan 2026 15:08:34 +0800
+
 kytensor-llm (2.0.0-ok15k0.7) v11-2603-preview; urgency=medium
 
   * BUG: 无
   * 需求: #591921 国产cpu适配,arm cpu线程检测策略优化
+  * 其他改动说明: 无
+  * 其他改动影响域: 无
+
+ -- liuyihu <liuyihu@kylinos.cn>  Thu, 22 Jan 2026 15:08:34 +0800
+
+kytensor-llm (2.0.0-ok15k0.5) v11-2603-preview; urgency=medium
+
+  * BUG: #507905 解决格兰菲卸载模型失败问题
+  * 需求: 无
   * 其他改动说明: 无
   * 其他改动影响域: 无
 

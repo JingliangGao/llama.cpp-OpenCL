@@ -217,6 +217,10 @@ struct llama_context {
             int64_t                          t_loop_start);
 
 private:
+#ifdef GGML_KYLIN_SUPPORT
+    void houmo_init(int32_t n_seq_max);              // JingliangGao 2026/06/26
+    int houmo_decode(const llama_batch &batch);       // JingliangGao 2026/06/26
+#endif
     //
     // output
     //

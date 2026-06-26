@@ -183,6 +183,56 @@ static int cpu_count_math_cpus(int n_cpu) {
 
 #endif // __x86_64__ && __linux__
 
+#ifdef GGML_KYLIN_SUPPORT
+#if defined(__aarch64__) && defined(__linux__) && !defined(__ANDROID__)
+static constexpr int kMaxCpuCheck = 128;
+static constexpr double kBigCoreFreqTol = 0.95;
+static constexpr int kMathMinBigMultiple = 2;
+static constexpr int kMathMaxBigMultiple = 3;
+
+static int32_t cpu_get_num_math_arm(int32_t physical_cores) {      // JingliangGao 2026/06/26
+    if (physical_cores <= 0) {
+        return physical_cores;
+    }
+    int n_cpu = (int)sysconf(_SC_NPROCESSORS_CONF);
+    if (n_cpu <= 0 || n_cpu > kMaxCpuCheck) {
+        n_cpu = kMaxCpuCheck;
+    }
+    std::vector<uint64_t> max_freq;
+    max_freq.reserve((size_t)n_cpu);
+    char path[64];
+    for (int cpu = 0; cpu < n_cpu; ++cpu) {
+        int len = snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+        if (len < 0 || (size_t)len >= sizeof(path)) {
+            break;
+        }
+        std::ifstream f(path);
+        if (!f.is_open()) {
+            break;
+        }
+        uint64_t hz = 0;
+        if (f >> hz) {
+            max_freq.push_back(hz);
+        }
+    }
+    if (max_freq.size() < 2) {
+        return physical_cores;
+    }
+    uint64_t max_hz = *std::max_element(max_freq.begin(), max_freq.end());
+    int32_t big = 0;
+    for (uint64_t hz : max_freq) {
+        if ((double)hz >= max_hz * kBigCoreFreqTol) {
+            ++big;
+        }
+    }
+    if (big > 0 && big < physical_cores) {
+        return std::max(std::min(physical_cores, big * kMathMaxBigMultiple), big * kMathMinBigMultiple);
+    }
+    return physical_cores;
+}
+#endif
+#endif
+
 /**
  * Returns number of CPUs on system that are useful for math.
  */
@@ -202,6 +252,17 @@ int32_t common_cpu_get_num_math() {
             }
         }
     }
+#endif
+#ifdef GGML_KYLIN_SUPPORT
+#if defined(__aarch64__) && defined(__linux__) && !defined(__ANDROID__)
+    {
+        int32_t physical = cpu_get_num_physical_cores();
+        int32_t math = cpu_get_num_math_arm(physical);
+        if (math > 0) {
+            return math;
+        }
+    }
+#endif
 #endif
     return common_cpu_get_num_physical_cores();
 }
@@ -1589,7 +1650,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.yarn_orig_ctx     = params.yarn_orig_ctx;
     cparams.pooling_type      = params.pooling_type;
     cparams.attention_type    = params.attention_type;
-    cparams.flash_attn_type   = params.flash_attn_type;
+    cparams.flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_DISABLED;         // JingliangGao 2026/06/26 - disable flash_attn to avoid warm-up segfault
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.offload_kqv       = !params.no_kv_offload;

@@ -1207,6 +1207,20 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+#ifdef GGML_KYLIN_SUPPORT
+bool llama_model::load_hmmodels(llama_model_loader & ml) {     // JingliangGao 2026/06/26
+    if (hm_llmodel == nullptr) {
+        hm_llmodel = std::make_shared<HouMoLLModel>();
+    }
+    void * decrypt_model_addr = gguf_get_model_addr(ml.meta.get());      // JingliangGao 2026/06/26
+    bool ret = hm_llmodel->houmo_load(ml);
+    if (decrypt_model_addr != nullptr) {                                // JingliangGao 2026/06/26
+        std::free(decrypt_model_addr);                                  // JingliangGao 2026/06/26
+    }
+    return ret;
+}
+#endif
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
