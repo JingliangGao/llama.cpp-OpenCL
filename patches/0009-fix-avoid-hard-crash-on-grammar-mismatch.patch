@@ -1,0 +1,68 @@
+From e5f627a477c1b8311961b5473704b7c243e396ad Mon Sep 17 00:00:00 2001
+From: luyuhong <luyuhong@kylinos.cn>
+Date: Fri, 17 Apr 2026 09:52:25 +0800
+Subject: [PATCH 09/20] fix: avoid hard crash on grammar mismatch
+
+1.When adapting to the custom template, some Hermes 2 Pro outputs start with an optional <think> block, which previously broke tool-call grammar constraints and could crash upstream on empty grammar stacks.
+2.Accept the optional prelude and degrade unsatisfiable grammar to an EOG-only terminal state (log instead of throw).
+
+Task: #599619
+
+From: kylin
+
+Severity: Important
+
+Tested-by: luyuhong <luyuhong@kylinos.cn>
+Change-Id: Iac44450fa794bf11d72f89d7fc2327bb8be870f0
+---
+ common/chat.cpp       | 7 ++++++-
+ src/llama-grammar.cpp | 9 ++++++++-
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 00740ee..99d1271 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1380,6 +1380,11 @@ static common_chat_params common_chat_params_init_hermes_2_pro(const common_chat
+     // (content)?(<tool_call>{"name": "foo", "arguments": {"a": 1}}</tool_call>)*
+     data.grammar_lazy = inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+     data.grammar = build_grammar([&](const common_grammar_builder & builder) {
++        // Some templates emit an optional <think>...</think> prelude before the first tool call.
++        // Make this prefix optional in the grammar to avoid hard failures when tools/grammar are enabled.
++        auto think_block = builder.add_rule("think_block", "\"<think>\" .* \"</think>\" space");
++        auto think_opt   = builder.add_rule("think_opt", "( " + think_block + " )? space");
++
+         std::vector<std::string> tool_rules;
+         std::vector<std::string> tool_call_alts;
+         foreach_function(inputs.tools, [&](const json & tool) {
+@@ -1428,7 +1433,7 @@ static common_chat_params common_chat_params_init_hermes_2_pro(const common_chat
+         tool_call_alts.push_back(
+             "( \"```\\n\" | \"```json\\n\" | \"```xml\\n\" ) space " + wrappable_tool_call + " space \"```\" space ");
+         auto tool_call = builder.add_rule("tool_call", string_join(tool_call_alts, " | "));
+-        builder.add_rule("root", inputs.parallel_tool_calls ? "(" + tool_call + ")+" : tool_call);
++        builder.add_rule("root", think_opt + (inputs.parallel_tool_calls ? "(" + tool_call + ")+" : tool_call));
+         data.grammar_triggers.push_back({COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<tool_call>"});
+         data.grammar_triggers.push_back({COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<function"});
+         // Trigger on some common known "good bad" outputs (only from the start and with a json that's about a specific argument name to avoid false positives)
+diff --git a/src/llama-grammar.cpp b/src/llama-grammar.cpp
+index 973b47a..1953d16 100644
+--- a/src/llama-grammar.cpp
++++ b/src/llama-grammar.cpp
+@@ -1214,6 +1214,13 @@ void llama_grammar_accept_str(struct llama_grammar & grammar, const std::string
+ 
+     grammar.partial_utf8 = decoded.second;
+     if (grammar.stacks.empty()) {
+-        throw std::runtime_error("Unexpected empty grammar stack after accepting piece: " + piece);
++        // Grammar became unsatisfiable after accepting this piece.
++        //
++        // Historically this threw, which can crash/abort upstream servers when grammar constraints
++        // (e.g. json_schema/tool-calling) and model output diverge. Instead, degrade gracefully by
++        // forcing the grammar into an "only EOG is allowed" terminal state. This prevents hard
++        // failures while still making the violation visible in logs.
++        LLAMA_LOG_ERROR("Unexpected empty grammar stack after accepting piece: '%s' (forcing terminal grammar state)", piece.c_str());
++        grammar.stacks = llama_grammar_stacks{ llama_grammar_stack{} };
+     }
+ }
+-- 
+2.43.0
+

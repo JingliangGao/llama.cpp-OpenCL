@@ -1,0 +1,52 @@
+From 179bff215c049d0cc840a7fd1640e9563a60e3c9 Mon Sep 17 00:00:00 2001
+From: Jiang Wu <wujiang@kylinos.cn>
+Date: Sat, 13 Jun 2026 13:32:42 +0800
+Subject: [PATCH 19/20] fix: seq-rm add ishoumo check
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Seq-rm add ishoumo check.
+
+Task: #624473
+
+From: kylin
+
+Severity: Important
+
+Changelog-Other: #624473 框架优化
+Changelog-Break: 无
+Change-Id: Ieb37ee7f610b8c0b897c9fef86b044b77f250cd4
+---
+ src/llama-context.cpp | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 418e2a6..e049c1a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2877,10 +2877,6 @@ bool llama_kv_cache_seq_rm(
+          llama_seq_id   seq_id,
+             llama_pos   p0,
+             llama_pos   p1) {
+-    if (ctx->get_model().hparams.is_hmm) {
+-        ctx->get_model().hm_llmodel->seq_rm(seq_id, p0, p1);
+-        return true;
+-    }
+     return llama_kv_self_seq_rm(ctx, seq_id, p0, p1);
+ }
+ 
+@@ -2889,6 +2885,10 @@ bool llama_kv_self_seq_rm(
+          llama_seq_id   seq_id,
+             llama_pos   p0,
+             llama_pos   p1) {
++    if (ctx->get_model().hparams.is_hmm) {
++        ctx->get_model().hm_llmodel->seq_rm(seq_id, p0, p1);
++        return true;
++    }
+     return llama_kv_cache_seq_rm(ctx->get_kv_self(), seq_id, p0, p1);
+ }
+ 
+-- 
+2.43.0
+

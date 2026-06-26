@@ -1,0 +1,349 @@
+From 462603763d5cb1f9f7ffbb5999a4e9e64ea9a345 Mon Sep 17 00:00:00 2001
+From: luyuhong <luyuhong@kylinos.cn>
+Date: Mon, 30 Mar 2026 18:09:25 +0800
+Subject: [PATCH 05/20] fix: Update PONN GGML backend interfaces and ops
+
+Adds inference-aware dtype selection.
+Fixes stride types for non-contiguous copies/get-rows, updates RoPE to
+support the new API.
+
+Bug: #510467
+
+From: kylin
+
+Severity: Critical
+
+Tested-by: luyuhong <luyuhong@kylinos.cn>
+Change-Id: I9855eb6746c78e144f8536741229ae00ee4019aa
+---
+ debian/changelog             |   6 +-
+ debian/control               |   2 +-
+ ggml/src/ggml-ponn/ops.cpp   | 116 ++++++++++++++++++++---------------
+ ggml/src/ggml-ponn/ponn.h    |  19 ++++--
+ ggml/src/ggml-ponn/utils.cpp |  10 +++
+ ggml/src/ggml-ponn/utils.h   |   1 +
+ 6 files changed, 93 insertions(+), 61 deletions(-)
+
+diff --git a/debian/changelog b/debian/changelog
+index 97d481b..a22d405 100644
+--- a/debian/changelog
++++ b/debian/changelog
+@@ -1,7 +1,7 @@
+-kytensor-llm (2.0.0-ok15k0.7) v11-2603-preview; urgency=medium
++kytensor-llm (2.0.0-ok15k0.8) v11-2603-preview; urgency=medium
+ 
+-  * BUG: 无
+-  * 需求: #591921 国产cpu适配,arm cpu线程检测策略优化
++  * BUG: #510467 修复在Arise2030卡上的推理问题
++  * 需求: 无
+   * 其他改动说明: 无
+   * 其他改动影响域: 无
+ 
+diff --git a/debian/control b/debian/control
+index 4554b46..409768a 100644
+--- a/debian/control
++++ b/debian/control
+@@ -2,7 +2,7 @@ Source: kytensor-llm
+ Section: libs
+ Priority: optional
+ Maintainer: kylin <liuyihu@kylinos.cn>
+-Build-Depends: git, cmake (>=3.18), tongyi-decrypt, libpciaccess-dev, debhelper-compat (= 12), gf-arise-llama-ponn (=02.00.08-1), ocl-icd-libopencl1, libcublas-dev-12-8, cuda-nvcc-12-8, rocm-cmake7.1.0 [amd64], rocm-core7.1.0 [amd64], rocm-device-libs7.1.0 [amd64], comgr-7.1.0 [amd64], rocm-llvm-dev7.1.0 [amd64],hsa-rocr7.1.0 [amd64], hip-dev7.1.0 [amd64], rocblas-dev7.1.0 [amd64], hipblas-dev7.1.0 [amd64], hsa-rocr-dev7.1.0 [amd64], libnvidia-compute-570, intel-oneapi-devel-2025.2 [amd64]
++Build-Depends: git, cmake (>=3.18), tongyi-decrypt, libpciaccess-dev, debhelper-compat (= 12), gf-arise-llama-ponn (=02.00.08-2), ocl-icd-libopencl1, libcublas-dev-12-8, cuda-nvcc-12-8, rocm-cmake7.1.0 [amd64], rocm-core7.1.0 [amd64], rocm-device-libs7.1.0 [amd64], comgr-7.1.0 [amd64], rocm-llvm-dev7.1.0 [amd64],hsa-rocr7.1.0 [amd64], hip-dev7.1.0 [amd64], rocblas-dev7.1.0 [amd64], hipblas-dev7.1.0 [amd64], hsa-rocr-dev7.1.0 [amd64], libnvidia-compute-570, intel-oneapi-devel-2025.2 [amd64]
+ Standards-Version: 1.0
+ Homepage: https://github.com/ggerganov/llama.cpp
+ 
+diff --git a/ggml/src/ggml-ponn/ops.cpp b/ggml/src/ggml-ponn/ops.cpp
+index a1d5227..7ab1f99 100644
+--- a/ggml/src/ggml-ponn/ops.cpp
++++ b/ggml/src/ggml-ponn/ops.cpp
+@@ -136,8 +136,8 @@ void ggml_ponn_sqr(ggml_backend_ponn_context& ctx, ggml_tensor* dst) {
+     GGML_ASSERT(0);
+ }
+ 
+-void ggml_ponn_clamp(ggml_backend_ponn_context& ctx, ggml_tensor* dst) {
+-    ggml_tensor* src = dst->src[0];
++void ggml_ponn_clamp(ggml_backend_ponn_context & ctx, ggml_tensor * dst) {
++    ggml_tensor * src = dst->src[0];
+     GGML_ASSERT(src->type == GGML_TYPE_F32);
+     GGML_ASSERT(dst->type == GGML_TYPE_F32);
+     float min;
+@@ -387,16 +387,12 @@ void ponn_dup_no_contiguous(ggml_tensor *dst) {
+     ponn_utils_get_stride_div(dst->type, dst_div);
+ 
+     std::vector<int> inputDims = {ne03, ne02, ne01, ne00};
+-    std::vector<int> inputStrides = {nb03/src_div, nb02/src_div, nb01/src_div, nb00/src_div};
++    std::vector<size_t> inputStrides = {nb03/src_div, nb02/src_div, nb01/src_div, nb00/src_div};
+     std::vector<int> outputDims = {ne3, ne2, ne1, ne0};
+-    std::vector<int> outputStrides = {nb3/dst_div, nb2/dst_div, nb1/dst_div, nb0/dst_div};
+-
+-    PONN_DATA_TYPE_E dtype = ponn_utils_get_data_type(dst->type);
+-    if(dtype == PONN_DATA_FLOAT && ponnGetInferenceDataType() == PONN_DATA_HALF)
+-        dtype = PONN_DATA_HALF;
+-    PONN_DATA_TYPE_E stype = ponn_utils_get_data_type(src0->type);
+-    if(stype == PONN_DATA_FLOAT && ponnGetInferenceDataType() == PONN_DATA_HALF)
+-        stype = PONN_DATA_HALF;
++    std::vector<size_t> outputStrides = {nb3/dst_div, nb2/dst_div, nb1/dst_div, nb0/dst_div};
++
++    PONN_DATA_TYPE_E dtype = ponn_utils_get_inference_data_type(dst->type);
++    PONN_DATA_TYPE_E stype = ponn_utils_get_inference_data_type(src0->type);
+     ponnMemcpyNoContiguous(input, output, inputDims, inputStrides, outputDims, outputStrides,
+                             stype, dtype,
+                             src_extra->offset, dst_extra->offset);
+@@ -413,12 +409,8 @@ void ggml_ponn_dup(ggml_backend_ponn_context& ctx, ggml_tensor* dst) {
+         if (src0->type == dst->type) {
+             ponnMemcpy(output, 0, input, 0, ggml_nbytes(src0), DEVICE_TO_DEVICE);
+         } else {
+-            PONN_DATA_TYPE_E dtype = ponn_utils_get_data_type(dst->type);
+-            if(dtype == PONN_DATA_FLOAT && ponnGetInferenceDataType() == PONN_DATA_HALF)
+-                dtype = PONN_DATA_HALF;
+-            PONN_DATA_TYPE_E stype = ponn_utils_get_data_type(src0->type);
+-            if(stype == PONN_DATA_FLOAT && ponnGetInferenceDataType() == PONN_DATA_HALF)
+-                stype = PONN_DATA_HALF;
++            PONN_DATA_TYPE_E dtype = ponn_utils_get_inference_data_type(dst->type);
++            PONN_DATA_TYPE_E stype = ponn_utils_get_inference_data_type(src0->type);
+             std::vector<int> dims = {src0->ne[3], src0->ne[2], src0->ne[1], src0->ne[0]};
+             ponnMemcpyEx(output, dtype, input, stype , ggml_nbytes(src0), dims, DEVICE_TO_DEVICE);
+ 
+@@ -570,9 +562,9 @@ void ggml_ponn_get_rows(ggml_backend_ponn_context& ctx, ggml_tensor* dst) {
+     std::vector<int> input0Dims = {ne03, ne02, ne01, ne00};
+     std::vector<int> input1Dims = {ne13, ne12, ne11, ne10};
+     std::vector<int> outputDims = {ne3, ne2, ne1, ne0};
+-    std::vector<int> input0Strides = {nb03/type_div, nb02/type_div, nb01/type_div, nb00/type_div};
+-    std::vector<int> input1Strides = {nb13, nb12, nb11, nb10};
+-    std::vector<int> outputStrides = {nb3/type_div, nb2/type_div, nb1/type_div, nb0/type_div};
++    std::vector<size_t> input0Strides = {nb03/type_div, nb02/type_div, nb01/type_div, nb00/type_div};
++    std::vector<size_t> input1Strides = {nb13, nb12, nb11, nb10};
++    std::vector<size_t> outputStrides = {nb3/type_div, nb2/type_div, nb1/type_div, nb0/type_div};
+ 
+     if (src0->type == GGML_TYPE_Q4_1) {
+         input0Dims[3] /= QK4_1;
+@@ -624,9 +616,7 @@ static void ggml_ponn_mul_mat_fp(ggml_backend_ponn_context& ctx,
+         size_t input_size = ggml_nbytes(input);
+         i_for_dims = ponnMallocBuf(input_size);
+         std::vector<int> dims = {input->ne[0], input->ne[1], input->ne[2], input->ne[3]};
+-        PONN_DATA_TYPE_E dtype = ponn_utils_get_data_type(input->type);
+-        if(dtype == PONN_DATA_FLOAT && ponnGetInferenceDataType() == PONN_DATA_HALF)
+-            dtype = PONN_DATA_HALF;
++        PONN_DATA_TYPE_E dtype = ponn_utils_get_inference_data_type(input->type);
+         ponnPermute(input0, i_for_dims, dtype, dims, {0, 2, 1, 3});
+         input0 = i_for_dims;
+     }
+@@ -649,12 +639,10 @@ static void ggml_ponn_mul_mat_fp(ggml_backend_ponn_context& ctx,
+ #endif
+     // weight permute
+     w_for_dims = ponnMallocBuf(weight_size);
++    PONN_DATA_TYPE_E weight_type = ponn_utils_get_inference_data_type(weight->type);
+     if(ggml_is_permuted(weight)) {
+         std::vector<int> dims = {weight->ne[0], weight->ne[1], weight->ne[2], weight->ne[3]};
+-        PONN_DATA_TYPE_E dtype = ponn_utils_get_data_type(weight->type);
+-        if(dtype == PONN_DATA_FLOAT && ponnGetInferenceDataType() == PONN_DATA_HALF)
+-            dtype = PONN_DATA_HALF;
+-        ponnPermute(input1, w_for_dims, dtype, dims, {0, 2, 1, 3}); //for k-cache
++        ponnPermute(input1, w_for_dims, weight_type, dims, {0, 2, 1, 3}); //for k-cache
+         input1 = w_for_dims;
+     }
+ 
+@@ -693,12 +681,12 @@ static void ggml_ponn_mul_mat_fp(ggml_backend_ponn_context& ctx,
+     if(bias) {
+         GGML_ASSERT(expanded==false);
+         ponnMulMatFpBias(input0, input1, input2, output,
+-                ponn_utils_get_data_type(input->type), ponn_utils_get_data_type(weight->type),
++                ponn_utils_get_data_type(input->type), weight_type,
+                 ponn_utils_get_data_type(bias->type), ponn_utils_get_data_type(dst->type),
+                 input0Spatial, input1Spatial, input2Spatial, outputSpatial,
+                 batch, n, m, k, group, alpha);
+     }else {
+-        ponnMulMatFp(input0, input1, output, ponn_utils_get_data_type(input->type), ponn_utils_get_data_type(weight->type),
++        ponnMulMatFp(input0, input1, output, ponn_utils_get_data_type(input->type), weight_type,
+                         ponn_utils_get_data_type(dst->type), input0Spatial, input1Spatial, outputSpatial,
+                         batch, n, m, k, group, expanded, alpha);
+     }
+@@ -846,8 +834,12 @@ void update_ggml_ponn_rope_cache(float freq_base, int rotary_dim, int n_ctx_orig
+     float *ps  = sin_cache;
+     float *pc  = cos_cache;
+     for(int i=0; i<n_ctx_orig * rotary_dim * 2; ++i) {
+-        if(i % 2 == 0) *(pc++) = rope_cache[i];
+-        else *(ps++) = rope_cache[i];
++        if(i % 2 == 0) {
++            *(pc++) = rope_cache[i];
++        }
++        else {
++            *(ps++) = rope_cache[i];
++        }
+     }
+     ctx.ponn_sin = ponnMallocBuf(sizeof(float) * (n_ctx_orig) * rotary_dim);
+     ctx.ponn_cos = ponnMallocBuf(sizeof(float) * (n_ctx_orig) * rotary_dim);
+@@ -867,6 +859,7 @@ void ggml_ponn_rope(ggml_backend_ponn_context& ctx, ggml_tensor* dst) {
+     // Only test with LLAMA model.
+     ggml_tensor* src0 = dst->src[0];
+     ggml_tensor* src1 = dst->src[1];
++    ggml_tensor* src2 = dst->src[2];
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+     const int rotary_dim = ((int32_t *) dst->op_params)[1];
+@@ -874,37 +867,58 @@ void ggml_ponn_rope(ggml_backend_ponn_context& ctx, ggml_tensor* dst) {
+     const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
+     const bool is_neox = mode & GGML_ROPE_TYPE_NEOX;
+ 
+-    if(ctx.ponn_sin == nullptr && ctx.ponn_cos == nullptr) {
+-        //calculate sin data and cos data
+-        float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+-        memcpy(&freq_base,   (int32_t *) dst->op_params +  5, sizeof(float));
+-        memcpy(&freq_scale,  (int32_t *) dst->op_params +  6, sizeof(float));
+-        memcpy(&ext_factor,  (int32_t *) dst->op_params +  7, sizeof(float));
+-        memcpy(&attn_factor, (int32_t *) dst->op_params +  8, sizeof(float));
+-        memcpy(&beta_fast,   (int32_t *) dst->op_params +  9, sizeof(float));
+-        memcpy(&beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
+-        update_ggml_ponn_rope_cache(freq_base, rotary_dim, n_ctx_orig, beta_fast, beta_slow, ext_factor, attn_factor, freq_scale, ctx);
+-    }
+-    GGML_ASSERT(ctx.ponn_sin);
+-    GGML_ASSERT(ctx.ponn_cos);
++    PONN_DATA_TYPE_E dataType = (src0->type == GGML_TYPE_F32 ? PONN_DATA_FLOAT : PONN_DATA_HALF);
+ 
+     std::vector<int> inputDims = {ne03, ne02, ne01, ne00};
++    std::vector<int> input2Dims = {ne13, ne12, ne11, ne10};
+     std::vector<int> outputDims = {ne3, ne2, ne1, ne0};
+     std::vector<int> posIdDims = {1, 1, 1, ne10};
+-    std::vector<int> sinDims = {1, 1, rotary_dim, rotary_dim};
+-    std::vector<int> cosDims = {1, 1, rotary_dim, rotary_dim};
++    int input_dims = n_ctx_orig;
++    std::vector<int> sinDims;
++    std::vector<int> cosDims;
++    if (dataType == PONN_DATA_FLOAT) {
++        sinDims = {1, 1, rotary_dim, rotary_dim};
++        cosDims = {1, 1, rotary_dim, rotary_dim};
++    } else {
++        sinDims = {1, 1, ne3 * ne2, rotary_dim};
++        cosDims = {1, 1, ne3 * ne2, rotary_dim};
++    }
++    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
++    memcpy(&freq_base,   (int32_t *) dst->op_params +  5, sizeof(float));
++    memcpy(&freq_scale,  (int32_t *) dst->op_params +  6, sizeof(float));
++    memcpy(&ext_factor,  (int32_t *) dst->op_params +  7, sizeof(float));
++    memcpy(&attn_factor, (int32_t *) dst->op_params +  8, sizeof(float));
++    memcpy(&beta_fast,   (int32_t *) dst->op_params +  9, sizeof(float));
++    memcpy(&beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
++
++    if(dataType == PONN_DATA_FLOAT && ctx.ponn_cos == nullptr && ctx.ponn_sin == nullptr) {
++        //calculate sin data and cos data
++        update_ggml_ponn_rope_cache(freq_base, rotary_dim, input_dims, beta_fast, beta_slow, ext_factor, attn_factor, freq_scale, ctx);
++        // update_ggml_ponn_rope_cache_fp32(freq_base, rotary_dim, input_dims, beta_fast, beta_slow, ext_factor, attn_factor, freq_scale, ctx, dst, ne3, ne2);
++        GGML_ASSERT(ctx.ponn_sin);
++        GGML_ASSERT(ctx.ponn_cos);
++    }
+ 
+-    PONN_MEM_H input = ponnPrepare(src0);
++    PONN_MEM_H    input = ponnPrepare(src0);
++    PONN_MEM_H input2 = src2 != nullptr ? ponnPrepare(src2) : nullptr;
+     PONN_MEM_H posId = ponnPrepare(src1);
+-    PONN_MEM_H sinData = ctx.ponn_sin;
+-    PONN_MEM_H cosData = ctx.ponn_cos;
++    PONN_MEM_H sinData = dataType == PONN_DATA_FLOAT ? ctx.ponn_sin : nullptr;
++    PONN_MEM_H cosData = dataType == PONN_DATA_FLOAT ? ctx.ponn_cos : nullptr;
+     PONN_MEM_H output = ponnPrepare(dst);
+-    ponnRope(input, posId, sinData, cosData, output, inputDims, posIdDims, sinDims, cosDims, outputDims, rotary_dim, is_neox);
++
++    if (dataType == PONN_DATA_FLOAT) {
++        ponnRope(input, posId, sinData, cosData, output, inputDims, posIdDims, sinDims, cosDims, outputDims, rotary_dim, is_neox, ponnGetInferenceDataType() == PONN_DATA_HALF ? PONN_DATA_HALF : dataType);
++    } else {
++        ponnRopeYarn(input, posId, input2, output, inputDims, posIdDims, input2Dims, outputDims, rotary_dim, n_ctx_orig, freq_base, freq_scale, ext_factor,
++                attn_factor, beta_fast, beta_slow, rotary_dim, is_neox, dataType);
++    }
++
+     ponnFinish(src0, input);
+     ponnFinish(src1, posId);
++    ponnFinish(src2, input2);
+     ponnFinish(dst, output);
+ #ifdef GGML_PONN_CHECK
+-    ggml_ponn_check(dst, 0.0001);
++    ggml_ponn_check(dst, 0.000001);
+ #endif
+     return;
+ }
+diff --git a/ggml/src/ggml-ponn/ponn.h b/ggml/src/ggml-ponn/ponn.h
+index 3eabe71..049292e 100644
+--- a/ggml/src/ggml-ponn/ponn.h
++++ b/ggml/src/ggml-ponn/ponn.h
+@@ -2,6 +2,7 @@
+ #define PONN_PONN_H
+ 
+ #include <chrono>
++#include <vector>
+ 
+ #ifdef  __cplusplus
+ extern "C" {
+@@ -92,8 +93,8 @@ void ponnMemcpy(void *dst, size_t dst_offset, const void *src, size_t src_offset
+ void ponnMemcpyEx(void *dst, PONN_DATA_TYPE_E dst_type, const void *src, PONN_DATA_TYPE_E src_type,
+                 size_t size, std::vector<int>&dims, PONN_MEMCPY_KIND kind);
+ void ponnMemcpyNoContiguous(PONN_MEM_H input, PONN_MEM_H output,
+-                            std::vector<int> &inputDims, std::vector<int> &inputStrides,
+-                            std::vector<int> &outputDims, std::vector<int> &outputStrides,
++                            std::vector<int> &inputDims, std::vector<size_t> &inputStrides,
++                            std::vector<int> &outputDims, std::vector<size_t> &outputStrides,
+                             PONN_DATA_TYPE_E inputType, PONN_DATA_TYPE_E outputType,
+                             size_t input_offset, size_t output_offset);
+ 
+@@ -129,9 +130,9 @@ void ponnRmsNorm(PONN_MEM_H input0, PONN_MEM_H input1, PONN_MEM_H output,
+ void ponnAttentionMask(PONN_MEM_H input0, PONN_MEM_H input1, PONN_MEM_H output, std::vector<int>& dims);
+ 
+ void ponnGetRows(PONN_MEM_H input0, PONN_MEM_H input1, PONN_MEM_H output,
+-                    std::vector<int> &input0Dims, std::vector<int> &input0Strides,
+-                    std::vector<int> &input1Dims, std::vector<int> &input1Strides,
+-                    std::vector<int> &outputDims, std::vector<int> &outputStrides,
++                    std::vector<int> &input0Dims, std::vector<size_t> &input0Strides,
++                    std::vector<int> &input1Dims, std::vector<size_t> &input1Strides,
++                    std::vector<int> &outputDims, std::vector<size_t> &outputStrides,
+                     PONN_DATA_TYPE_E inputType);
+ 
+ void ponnRope(PONN_MEM_H input, PONN_MEM_H posId, PONN_MEM_H sin,
+@@ -139,7 +140,13 @@ void ponnRope(PONN_MEM_H input, PONN_MEM_H posId, PONN_MEM_H sin,
+                 std::vector<int> &inputDims, std::vector<int> &posIdDims,
+                 std::vector<int> &sinDims, std::vector<int> &cosDims,
+                 std::vector<int> &outputDims, const int rotary_dim,
+-                const bool is_neox);
++                const bool is_neox, PONN_DATA_TYPE_E inputType);
++
++void ponnRopeYarn(PONN_MEM_H input0, PONN_MEM_H posId, PONN_MEM_H input2, PONN_MEM_H output,
++                  std::vector<int> & input0Dims, std::vector<int> & posIdDims, std::vector<int>& input2Dims,
++                  std::vector<int> & outputDims, const int n_dims, const int n_ctx_orig, const float freq_base,
++                  const float freq_scale, const float ext_factor, const float attn_factor, const float beta_fast,
++                  const float beta_slow, const int rotary_dim, const bool is_neox, PONN_DATA_TYPE_E inputType);
+ size_t ponnGetMaxMemoryAllocateSize();
+ #ifdef  __cplusplus
+ }
+diff --git a/ggml/src/ggml-ponn/utils.cpp b/ggml/src/ggml-ponn/utils.cpp
+index 7139b4d..20a1aa8 100644
+--- a/ggml/src/ggml-ponn/utils.cpp
++++ b/ggml/src/ggml-ponn/utils.cpp
+@@ -97,6 +97,16 @@ PONN_DATA_TYPE_E ponn_utils_get_data_type(const ggml_type dtype){
+     return PONN_DATA_FLOAT;
+ }
+ 
++PONN_DATA_TYPE_E ponn_utils_get_inference_data_type(const ggml_type dtype){
++    PONN_DATA_TYPE_E ponnDataType =  ponnGetInferenceDataType();
++    PONN_DATA_TYPE_E srcDataType = ponn_utils_get_data_type(dtype);
++    if(ponnDataType == PONN_DATA_HALF &&
++        srcDataType == PONN_DATA_FLOAT) {
++            return PONN_DATA_HALF;
++        }
++    return srcDataType;
++}
++
+ void ponn_utils_get_tensor_dims(std::vector<int>& dims, const int64_t* ne){
+     dims.clear();
+     for(int i = 1; i < GGML_MAX_DIMS + 1; ++i) {
+diff --git a/ggml/src/ggml-ponn/utils.h b/ggml/src/ggml-ponn/utils.h
+index d478988..463f2b2 100644
+--- a/ggml/src/ggml-ponn/utils.h
++++ b/ggml/src/ggml-ponn/utils.h
+@@ -37,6 +37,7 @@ double ponn_utils_get_span(std::chrono::system_clock::time_point time1, std::chr
+ bool ponn_utils_is_padded_1d_0(const struct ggml_tensor * tensor);
+ 
+ PONN_DATA_TYPE_E ponn_utils_get_data_type(const ggml_type dtype);
++PONN_DATA_TYPE_E ponn_utils_get_inference_data_type(const ggml_type dtype);
+ void ponn_utils_get_stride_div(ggml_type g_type, size_t &stride_div);
+ void ponn_utils_get_tensor_dims(std::vector<int>& dims, const int64_t* ne);
+ #endif
+-- 
+2.43.0
+

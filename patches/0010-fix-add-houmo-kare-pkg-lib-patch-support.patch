@@ -1,0 +1,93 @@
+From ef6b050417abdcd0fb0cd494288a9075c719d451 Mon Sep 17 00:00:00 2001
+From: lizhenneng <lizhenneng@kylinos.cn>
+Date: Thu, 30 Apr 2026 16:57:06 +0800
+Subject: [PATCH 10/20] fix: add houmo kare pkg lib patch support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Houmo tcim package has been installed to kare directory, change lib
+path for dlopen.
+
+Task: #525831
+
+From: kylin
+
+Severity: Important
+
+Changelog-Story: #53205 适配后摩kare包库查找路径
+Change-Id: I87d62f3642b3049cfb7e6020712c3a245b42d43c
+---
+ debian/changelog      | 20 ++++++++++++++++++++
+ src/houmo-llmodel.cpp | 17 ++++++++++++-----
+ 2 files changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/debian/changelog b/debian/changelog
+index a22d405..8f7a5ad 100644
+--- a/debian/changelog
++++ b/debian/changelog
+@@ -1,3 +1,23 @@
++kytensor-llm (2.0.0-ok19k1.0) v11-2603-preview; urgency=medium
++
++  * BUG: 无
++  * 需求: #53205 add houmo kare pkg lib patch support
++  * 其他改动说明: 无
++  * 其他改动影响域: 无
++
++ -- liuyihu <liuyihu@kylinos.cn>  Fri, 01 May 2026 15:08:34 +0800
++
++
++kytensor-llm (2.0.0-ok19) v11-2603-preview; urgency=medium
++
++  * BUG: 无
++  * 需求: #53205 add houmo kare pkg lib patch support
++  * 其他改动说明: 无
++  * 其他改动影响域: 无
++
++ -- liuyihu <liuyihu@kylinos.cn>  Thu, 22 Jan 2026 15:08:34 +0800
++
++
+ kytensor-llm (2.0.0-ok15k0.8) v11-2603-preview; urgency=medium
+ 
+   * BUG: #510467 修复在Arise2030卡上的推理问题
+diff --git a/src/houmo-llmodel.cpp b/src/houmo-llmodel.cpp
+index 6fc0ef7..559095b 100644
+--- a/src/houmo-llmodel.cpp
++++ b/src/houmo-llmodel.cpp
+@@ -8,6 +8,9 @@
+ #include <cstring>
+ #include <fstream>
+ #include <map>
++#ifndef _WIN32
++#include <unistd.h>
++#endif
+ #ifdef ENABLE_HOUMO_DADAO
+ #include "tcim_c_api_loader.h"
+ #include "houmo-embedding-layer.h"
+@@ -22,14 +25,18 @@ static bool g_tcim_loaded = false;
+ static bool load_tcim_library() {
+     if (g_tcim_loaded) return true;
+ 
+-    const char* lib_path = std::getenv("TCIM_LIBRARY_PATH");
+-    if (!lib_path) {
++    const char* lib_path = nullptr;
+ #ifdef _WIN32
+-        lib_path = "tcim_c_api_bridge.dll";
++    lib_path = "tcim_c_api_bridge.dll";
+ #else
+-        lib_path = "/usr/local/houmo/lib/libtcim_runtime_c_api.so";
+-#endif
++    if (access("/opt/system/lib/xpu/houmo/libtcim_runtime_c_api.so", F_OK) == 0) {
++        lib_path = "/opt/system/lib/xpu/houmo/libtcim_runtime_c_api.so";
++    } else if (access("/usr/lib/xpu/houmo/libtcim_runtime_c_api.so", F_OK) == 0) {
++        lib_path = "/usr/lib/xpu/houmo/libtcim_runtime_c_api.so";
++    } else {
++        lib_path = "libtcim_runtime_c_api.so";
+     }
++#endif
+ 
+     if (!tcim_load_library(lib_path, &g_tcim_api)) {
+         LLAMA_LOG_ERROR("Failed to load TCIM library: %s\n", tcim_get_last_error());
+-- 
+2.43.0
+

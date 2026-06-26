@@ -1,0 +1,42 @@
+From 565c108665b539851350432c7cbad2cf38691a2c Mon Sep 17 00:00:00 2001
+From: lizhenneng <lizhenneng@kylinos.cn>
+Date: Thu, 26 Mar 2026 13:20:29 +0800
+Subject: [PATCH 04/20] fix: free decrypted memory for houmo
+
+After loaded model to houmo npu, model in ram can be recycled.
+
+Bug: #507905
+
+Req: yes
+
+From: kylin
+
+Severity: Critical
+
+Tested-by: lizhenneng@kylinos.cn
+Change-Id: I9c1a95281723f54d18a850cacd4645429a29aa6a
+Signed-off-by: lizhenneng <lizhenneng@kylinos.cn>
+---
+ src/llama.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 07c06bd..48e4254 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -123,8 +123,11 @@ static int llama_model_load(const std::string & fname, std::vector<std::string>
+         }
+         model.hparams.is_hmm = model.gguf_kv.count("is_hmm") > 0;
+         LLAMA_LOG_INFO("%s:%d: loading hmmodes %d\n", __func__, __LINE__, model.hparams.is_hmm);
++	void * decrypt_model_addr = gguf_get_model_addr(ml.meta.get());
+         if (model.hparams.is_hmm) {
+-            return model.load_hmmodels(ml) ? 0 : -1;
++            int ret = model.load_hmmodels(ml) ? 0 : -1;
++	    free(decrypt_model_addr);
++	    return ret;
+         }
+ 
+         if (!model.load_tensors(ml)) {
+-- 
+2.43.0
+

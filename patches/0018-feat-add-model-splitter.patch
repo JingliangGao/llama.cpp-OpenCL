@@ -1,0 +1,503 @@
+From bc64ff2be39dfc52df69362c5f174fd98ca10924 Mon Sep 17 00:00:00 2001
+From: zhongpei <zhongpei@kylinos.cn>
+Date: Tue, 9 Jun 2026 17:31:36 +0800
+Subject: [PATCH 18/20] feat: add model splitter
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add model splitter class
+
+Task: #624473
+
+From: kylin
+
+Severity: Important
+
+Changelog-Other: #624473 框架优化
+Changelog-Break: 无
+Change-Id: I470c6d048f612ee5be4602fac9dc77287d23a883
+---
+ common/CMakeLists.txt  |   2 +
+ common/arg.cpp         |  17 +++
+ common/common.cpp      |   4 +
+ common/model-split.cpp | 309 +++++++++++++++++++++++++++++++++++++++++
+ common/model-split.h   |  61 ++++++++
+ debian/changelog       |   9 ++
+ 6 files changed, 402 insertions(+)
+ create mode 100644 common/model-split.cpp
+ create mode 100644 common/model-split.h
+
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index 1b4646a..8d9350c 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -72,6 +72,8 @@ add_library(${TARGET}
+     log.h
+     minja/chat-template.hpp
+     minja/minja.hpp
++    model-split.cpp
++    model-split.h
+     ngram-cache.cpp
+     ngram-cache.h
+     reasoning-budget.cpp
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 6edd77e..32fe904 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3,6 +3,7 @@
+ #include "log.h"
+ #include "sampling.h"
+ #include "chat.h"
++#include "model-split.h"
+ 
+ #include <algorithm>
+ #include <climits>
+@@ -1678,6 +1679,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.check_tensors = true;
+         }
+     ));
++    add_opt(common_arg(
++        {"--auto-split"}, "[CONFIG]",
++        "automatically split model across GPUs based on file size and VRAM budget (default: disabled)\n"
++        "CONFIG format: on[,vram=N][,ratio=N][,max_layers=N]\n"
++        "  - vram: VRAM budget (e.g., 8G, 16G, 0 = auto-detect)\n"
++        "  - ratio: target VRAM usage ratio (0.0-1.0, default: 0.85)\n"
++        "  - max_layers: maximum number of layers to offload (0 = unlimited)\n"
++        "examples: --auto-split on, --auto-split on,vram=8G, --auto-split on,ratio=0.9,max_layers=50",
++        [](common_params & params, const std::string & value) {
++            struct common_model_split_config config;
++            if (!common_model_split_parse_config(value, config)) {
++                throw std::invalid_argument(string_format("invalid auto-split config: %s", value.c_str()));
++            }
++            common_model_split_set_config(config);
++        }
++    ).set_env("LLAMA_ARG_AUTO_SPLIT"));
+     add_opt(common_arg(
+         {"--override-kv"}, "KEY=TYPE:VALUE",
+         "advanced option to override model metadata by key. may be specified multiple times.\n"
+diff --git a/common/common.cpp b/common/common.cpp
+index 4d5ca6b..a66bc57 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "common.h"
+ #include "log.h"
++#include "model-split.h"
+ // Change JSON_ASSERT from assert() to GGML_ASSERT:
+ #define JSON_ASSERT GGML_ASSERT
+ #include <nlohmann/json.hpp>
+@@ -921,6 +922,9 @@ struct common_init_result common_init_from_params(common_params & params) {
+     postprocess_cpu_params(params.speculative.cpuparams,       &params.cpuparams);
+     postprocess_cpu_params(params.speculative.cpuparams_batch, &params.cpuparams_batch);
+ 
++    // Apply auto-split configuration if enabled
++    common_model_auto_split_apply(params);
++
+     auto mparams = common_model_params_to_llama(params);
+ 
+     llama_model * model = nullptr;
+diff --git a/common/model-split.cpp b/common/model-split.cpp
+new file mode 100644
+index 0000000..21065df
+--- /dev/null
++++ b/common/model-split.cpp
+@@ -0,0 +1,309 @@
++#include "model-split.h"
++#include "common.h"
++#include "log.h"
++
++#include <fstream>
++#include <sstream>
++#include <string>
++#include <vector>
++#include <algorithm>
++#include <cmath>
++#include <cstdlib>
++
++// Helper to convert size string to bytes (supports K, M, G, T suffixes)
++size_t common_parse_size(const std::string & size_str) {
++    if (size_str.empty()) {
++        return 0;
++    }
++
++    char * end = nullptr;
++    double value = std::strtod(size_str.c_str(), &end);
++
++    if (end == size_str.c_str()) {
++        return 0; // No valid number found
++    }
++
++    if (*end != '\0') {
++        // Check for suffix
++        char suffix = *end;
++        switch (suffix) {
++            case 'T': case 't':
++                value *= 1024.0 * 1024 * 1024 * 1024;
++                break;
++            case 'G': case 'g':
++                value *= 1024.0 * 1024 * 1024;
++                break;
++            case 'M': case 'm':
++                value *= 1024.0 * 1024;
++                break;
++            case 'K': case 'k':
++                value *= 1024.0;
++                break;
++            default:
++                return 0; // Invalid suffix
++        }
++    }
++
++    return static_cast<size_t>(value);
++}
++
++// Get default split configuration
++struct common_model_split_config common_model_split_default_config(void) {
++    struct common_model_split_config config;
++    config.enabled = false;
++    config.vram_budget_bytes = 0; // auto-detect
++    config.vram_usage_ratio = 0.85f;
++    config.min_layer_size_bytes = 0; // auto-detect
++    config.max_gpu_layers = 0; // unlimited
++    return config;
++}
++
++// Estimate model size from GGUF file without loading the model
++uint64_t common_model_estimate_size(const std::string & model_path) {
++    std::ifstream file(model_path, std::ios::binary | std::ios::ate);
++    if (!file.is_open()) {
++        LOG_ERR("%s: failed to open model file '%s'\n", __func__, model_path.c_str());
++        return 0;
++    }
++
++    // Get file size
++    uint64_t file_size = static_cast<uint64_t>(file.tellg());
++    file.seekg(0, std::ios::beg);
++
++    // Read magic number
++    char magic[4] = {0};
++    file.read(magic, sizeof(magic));
++    if (magic[0] != 'G' || magic[1] != 'G' || magic[2] != 'U' || magic[3] != 'F') {
++        LOG_ERR("%s: invalid GGUF file '%s'\n", __func__, model_path.c_str());
++        return 0;
++    }
++
++    // Return file size as model size estimate
++    return file_size;
++}
++
++// Get total available VRAM across all GPUs in bytes
++size_t common_get_available_vram(void) {
++    size_t total_vram = 0;
++
++    // Count GPU devices
++    size_t n_devices = ggml_backend_dev_count();
++    for (size_t i = 0; i < n_devices; ++i) {
++        auto * dev = ggml_backend_dev_get(i);
++        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++            size_t free_mem, total_mem;
++            ggml_backend_dev_memory(dev, &free_mem, &total_mem);
++            total_vram += total_mem;
++        }
++    }
++
++    return total_vram;
++}
++
++// Auto-determine n_gpu_layers based on model size and VRAM budget
++int common_model_auto_split_n_gpu_layers(
++    const std::string & model_path,
++    const struct common_model_split_config & config,
++    int model_n_layers) {
++
++    if (model_n_layers <= 0) {
++        LOG_ERR("%s: invalid model layer count: %d\n", __func__, model_n_layers);
++        return -1;
++    }
++
++    // Get model size
++    uint64_t model_size = common_model_estimate_size(model_path);
++    if (model_size == 0) {
++        LOG_ERR("%s: failed to estimate model size for '%s'\n", __func__, model_path.c_str());
++        return -1;
++    }
++
++    // Get VRAM budget
++    size_t vram_budget = config.vram_budget_bytes;
++    if (vram_budget == 0) {
++        vram_budget = common_get_available_vram();
++    }
++
++    if (vram_budget == 0) {
++        LOG_WRN("%s: no VRAM available, disabling auto-split\n", __func__);
++        return -1;
++    }
++
++    // Apply VRAM usage ratio
++    size_t effective_vram = static_cast<size_t>(static_cast<double>(vram_budget) * config.vram_usage_ratio);
++
++    // Calculate average layer size
++    uint64_t avg_layer_size = model_size / static_cast<uint64_t>(model_n_layers);
++
++    // Check if model is small enough to fit entirely in VRAM
++    if (model_size <= effective_vram) {
++        LOG_INF("%s: model size (%.2f GB) fits in VRAM (%.2f GB), loading full model\n",
++                __func__,
++                static_cast<double>(model_size) / (1024.0 * 1024 * 1024),
++                static_cast<double>(effective_vram) / (1024.0 * 1024 * 1024));
++        return -1; // No splitting needed
++    }
++
++    // Calculate how many layers can fit in VRAM
++    int n_gpu_layers = static_cast<int>(effective_vram / avg_layer_size);
++
++    // Clamp to valid range
++    if (n_gpu_layers < 0) {
++        n_gpu_layers = 0;
++    }
++    if (n_gpu_layers > model_n_layers) {
++        n_gpu_layers = model_n_layers;
++    }
++
++    // Apply max_gpu_layers limit if set
++    if (config.max_gpu_layers > 0) {
++        if (n_gpu_layers > config.max_gpu_layers) {
++            n_gpu_layers = config.max_gpu_layers;
++        }
++    }
++
++    // If we can't offload any layers, disable splitting
++    if (n_gpu_layers == 0) {
++        LOG_INF("%s: model size (%.2f GB) exceeds VRAM (%.2f GB), but no layers fit in VRAM, running on CPU\n",
++                __func__,
++                static_cast<double>(model_size) / (1024.0 * 1024 * 1024),
++                static_cast<double>(effective_vram) / (1024.0 * 1024 * 1024));
++        return 0;
++    }
++
++    LOG_INF("%s: model size: %.2f GB, VRAM budget: %.2f GB, avg layer size: %.2f MB, offloading %d/%d layers\n",
++            __func__,
++            static_cast<double>(model_size) / (1024.0 * 1024 * 1024),
++            static_cast<double>(effective_vram) / (1024.0 * 1024 * 1024),
++            static_cast<double>(avg_layer_size) / (1024.0 * 1024),
++            n_gpu_layers, model_n_layers);
++
++    return n_gpu_layers;
++}
++
++// Parse split config from string
++bool common_model_split_parse_config(const std::string & value, struct common_model_split_config & config) {
++    config = common_model_split_default_config();
++
++    if (value.empty()) {
++        return false;
++    }
++
++    // Check if enabled
++    bool is_enabled = false;
++    std::string options_str;
++
++    if (value == "on" || value == "true" || value == "1") {
++        is_enabled = true;
++        options_str = "";
++    } else if (value.size() > 3 && value.substr(0, 3) == "on,") {
++        is_enabled = true;
++        options_str = value.substr(3);
++    } else if (value.size() > 5 && value.substr(0, 5) == "true,") {
++        is_enabled = true;
++        options_str = value.substr(5);
++    } else if (value.size() > 2 && value.substr(0, 2) == "1,") {
++        is_enabled = true;
++        options_str = value.substr(2);
++    } else {
++        return false;
++    }
++
++    if (!is_enabled) {
++        return false;
++    }
++
++    config.enabled = true;
++
++    // Parse key=value pairs
++    if (options_str.empty()) {
++        return true;
++    }
++
++    std::istringstream iss(options_str);
++    std::string token;
++    while (std::getline(iss, token, ',')) {
++        size_t eq_pos = token.find('=');
++        if (eq_pos == std::string::npos) {
++            LOG_ERR("%s: invalid option format: '%s'\n", __func__, token.c_str());
++            return false;
++        }
++
++        std::string key = token.substr(0, eq_pos);
++        std::string val = token.substr(eq_pos + 1);
++
++        if (key == "vram") {
++            config.vram_budget_bytes = common_parse_size(val);
++        } else if (key == "ratio") {
++            config.vram_usage_ratio = std::stof(val);
++            if (config.vram_usage_ratio <= 0.0f || config.vram_usage_ratio > 1.0f) {
++                LOG_ERR("%s: invalid ratio value: %s\n", __func__, val.c_str());
++                return false;
++            }
++        } else if (key == "max_layers") {
++            config.max_gpu_layers = std::stoi(val);
++            if (config.max_gpu_layers < 0) {
++                LOG_ERR("%s: invalid max_layers value: %s\n", __func__, val.c_str());
++                return false;
++            }
++        } else {
++            LOG_ERR("%s: unknown option: '%s'\n", __func__, key.c_str());
++            return false;
++        }
++    }
++
++    return true;
++}
++
++// Global auto-split config (set via CLI)
++static struct common_model_split_config g_split_config = common_model_split_default_config();
++
++void common_model_split_set_config(const struct common_model_split_config & config) {
++    g_split_config = config;
++}
++
++const struct common_model_split_config & common_model_split_get_config(void) {
++    return g_split_config;
++}
++
++void common_model_auto_split_apply(common_params & params) {
++    if (!g_split_config.enabled) {
++        return; // Auto-split is disabled
++    }
++
++    // Only apply if n_gpu_layers is not explicitly set (still -1)
++    if (params.n_gpu_layers != -1) {
++        LOG_INF("%s: n_gpu_layers already set to %d, skipping auto-split\n", __func__, params.n_gpu_layers);
++        return;
++    }
++
++    // Load model to get layer count
++    // We need to load the model metadata first to get n_layer
++    struct llama_model_params mparams = llama_model_default_params();
++    mparams.n_gpu_layers = 0; // Don't load any layers yet
++
++    struct llama_model * model = llama_model_load_from_file(params.model.c_str(), mparams);
++    if (!model) {
++        LOG_ERR("%s: failed to load model '%s' for auto-split\n", __func__, params.model.c_str());
++        return;
++    }
++
++    int n_layers = llama_model_n_layer(model);
++    llama_model_free(model);
++
++    if (n_layers <= 0) {
++        LOG_ERR("%s: invalid layer count: %d\n", __func__, n_layers);
++        return;
++    }
++
++    // Calculate optimal n_gpu_layers
++    int n_gpu_layers = common_model_auto_split_n_gpu_layers(
++        params.model, g_split_config, n_layers);
++
++    if (n_gpu_layers >= 0) {
++        params.n_gpu_layers = n_gpu_layers;
++        LOG_INF("%s: auto-split set n_gpu_layers to %d\n", __func__, n_gpu_layers);
++    } else {
++        LOG_INF("%s: auto-split determined no splitting is needed\n", __func__);
++    }
++}
+\ No newline at end of file
+diff --git a/common/model-split.h b/common/model-split.h
+new file mode 100644
+index 0000000..d82cc2f
+--- /dev/null
++++ b/common/model-split.h
+@@ -0,0 +1,61 @@
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++//
++// Model auto-split utilities
++//
++// This module provides functionality to automatically determine
++// whether a model should be split across GPUs based on its file size,
++// and automatically configures n_gpu_layers accordingly.
++//
++
++struct common_params;
++
++// Auto-split configuration parameters
++struct common_model_split_config {
++    bool enabled;                    // whether to enable auto-split (default: false)
++    size_t vram_budget_bytes;        // available VRAM budget in bytes (0 = auto-detect)
++    float vram_usage_ratio;          // target VRAM usage ratio (0.0-1.0, default: 0.85)
++    size_t min_layer_size_bytes;     // minimum size per layer to consider for splitting
++    int max_gpu_layers;              // maximum number of layers to offload (0 = unlimited)
++};
++
++// Get default split configuration
++struct common_model_split_config common_model_split_default_config(void);
++
++// Estimate model size from GGUF file without loading the model
++// Returns 0 on failure, otherwise returns estimated model size in bytes
++uint64_t common_model_estimate_size(const std::string & model_path);
++
++// Get total available VRAM across all GPUs in bytes
++// Returns 0 if no GPU is available or VRAM detection is not supported
++size_t common_get_available_vram(void);
++
++// Auto-determine n_gpu_layers based on model size and VRAM budget
++// Returns the recommended number of GPU layers, or -1 if no offloading is needed
++// If split is not needed, returns -1 to indicate no extra operation
++int common_model_auto_split_n_gpu_layers(
++    const std::string & model_path,
++    const struct common_model_split_config & config,
++    int model_n_layers);
++
++// Apply auto-split configuration to common_params
++// This function will modify params.n_gpu_layers based on model size and VRAM budget
++// Only takes effect if config.enabled is true
++void common_model_auto_split_apply(common_params & params);
++
++// Parse split config from string (for CLI argument parsing)
++// Format: "enabled[,vram=N][,ratio=N][,max_layers=N]"
++// Examples: "on", "on,vram=8G", "on,ratio=0.9", "on,vram=16G,ratio=0.85,max_layers=50"
++bool common_model_split_parse_config(const std::string & value, struct common_model_split_config & config);
++
++// Helper to convert size string to bytes (supports K, M, G, T suffixes)
++size_t common_parse_size(const std::string & size_str);
++
++// Set the global split config (called from CLI argument handler)
++void common_model_split_set_config(const struct common_model_split_config & config);
++
++// Get the current global split config
++const struct common_model_split_config & common_model_split_get_config(void);
+diff --git a/debian/changelog b/debian/changelog
+index cb39cf0..7cacc18 100644
+--- a/debian/changelog
++++ b/debian/changelog
+@@ -1,3 +1,12 @@
++kytensor-llm (2.0.0-ok19k1.0update7) v11-2603-preview; urgency=medium
++
++  * BUG: 无
++  * 需求: 无
++  * 其他改动说明: task: #624473 框架优化
++  * 其他改动影响域: 模型加载
++
++ -- liuyihu <liuyihu@kylinos.cn>  Sun, 3 Jun 2026 15:08:34 +0800
++
+ kytensor-llm (2.0.0-ok19k1.0update6) v11-2603-preview; urgency=medium
+ 
+   * BUG: 无
+-- 
+2.43.0
+

@@ -1,0 +1,4260 @@
+From 9ff0f535341edf8cc76b665e0699460cb69fdf70 Mon Sep 17 00:00:00 2001
+From: luyuhong <luyuhong@kylinos.cn>
+Date: Fri, 23 Jan 2026 10:32:11 +0800
+Subject: [PATCH 02/20] feat: add houmo npu support
+
+- Add Dadao text LLM inference support for Qwen3/Qwen2.5/Qwen2 on houmo
+  M50 and M30 NPU.
+- Add prompt caching support to improve inference efficiency.
+- Enable plugin-based model loading for better flexibility.
+- Add support for interruption during the prefill stage to allow
+   early termination and improve runtime controllability.(20260224)
+
+Task: #525831
+
+From: kylin
+
+Severity: Critical
+
+Tested-by: luyuhong <luyuhong@kylinos.cn>
+Change-Id: I4ae394a25b3c702fd9af8430247917017ae4894f
+Signed-off-by: luyuhong <luyuhong@kylinos.cn>
+---
+ CMakeLists.txt                |    6 +
+ convert_hm_to_gguf.py         | 1643 +++++++++++++++++++++++++++++++++
+ debian/changelog              |    6 +-
+ examples/server/server.cpp    |    7 +-
+ ggml/src/CMakeLists.txt       |    2 +-
+ src/CMakeLists.txt            |    5 +-
+ src/houmo-embedding-layer.cpp |  162 ++++
+ src/houmo-embedding-layer.h   |   64 ++
+ src/houmo-llmodel.cpp         | 1102 ++++++++++++++++++++++
+ src/houmo-llmodel.h           |   39 +
+ src/llama-adapter.cpp         |    5 +-
+ src/llama-context.cpp         |  167 +++-
+ src/llama-context.h           |    4 +-
+ src/llama-hparams.h           |    2 +
+ src/llama-model-loader.cpp    |    1 +
+ src/llama-model-loader.h      |    3 +-
+ src/llama-model.cpp           |    6 +
+ src/llama-model.h             |    6 +
+ src/llama.cpp                 |    5 +
+ src/tcim_c_api.h              |  500 ++++++++++
+ src/tcim_c_api_loader.h       |  154 +++
+ 21 files changed, 3870 insertions(+), 19 deletions(-)
+ create mode 100755 convert_hm_to_gguf.py
+ create mode 100644 src/houmo-embedding-layer.cpp
+ create mode 100644 src/houmo-embedding-layer.h
+ create mode 100644 src/houmo-llmodel.cpp
+ create mode 100644 src/houmo-llmodel.h
+ create mode 100644 src/tcim_c_api.h
+ create mode 100644 src/tcim_c_api_loader.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 436aa98..8cdf799 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -12,6 +12,12 @@ if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
+     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
+ endif()
+ 
++option(ENABLE_HOUMO_DADAO "EANABLUE HOUMO_DADAO" ON)  # 初始值为 ON
++
++IF (ENABLE_HOUMO_DADAO)
++    add_definitions(-DENABLE_HOUMO_DADAO)
++ENDIF()
++
+ # Add path to modules
+ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
+ 
+diff --git a/convert_hm_to_gguf.py b/convert_hm_to_gguf.py
+new file mode 100755
+index 0000000..f0603a2
+--- /dev/null
++++ b/convert_hm_to_gguf.py
+@@ -0,0 +1,1643 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++
++from __future__ import annotations
++
++import ast
++import logging
++import argparse
++import contextlib
++import json
++import os
++import sys
++from enum import IntEnum
++from pathlib import Path
++from hashlib import sha256
++from typing import (
++    Any,
++    Callable,
++    ContextManager,
++    Iterable,
++    Iterator,
++    Literal,
++    Sequence,
++    TypeVar,
++    cast,
++)
++from itertools import chain
++
++import numpy as np
++import torch
++from torch import Tensor
++import torch.nn as nn
++import io
++
++if "NO_LOCAL_GGUF" not in os.environ:
++    sys.path.insert(1, str(Path(__file__).parent / "gguf-py"))
++import gguf
++
++logger = logging.getLogger("hf-to-gguf")
++
++
++###### MODEL DEFINITIONS ######
++
++
++class SentencePieceTokenTypes(IntEnum):
++    NORMAL = 1
++    UNKNOWN = 2
++    CONTROL = 3
++    USER_DEFINED = 4
++    UNUSED = 5
++    BYTE = 6
++
++
++AnyModel = TypeVar("AnyModel", bound="type[Model]")
++
++
++class Model:
++    _model_classes: dict[str, type[Model]] = {}
++
++    dir_model: Path
++    ftype: gguf.LlamaFileType
++    fname_out: Path
++    is_big_endian: bool
++    endianess: gguf.GGUFEndian
++    use_temp_file: bool
++    lazy: bool
++    part_names: list[str]
++    is_safetensors: bool
++    hparams: dict[str, Any]
++    block_count: int
++    tensor_map: gguf.TensorNameMap
++    tensor_names: set[str] | None
++    gguf_writer: gguf.GGUFWriter
++    model_name: str | None
++    metadata_override: Path | None
++    dir_model_card: Path
++
++    # subclasses should define this!
++    model_arch: gguf.MODEL_ARCH
++
++    def __init__(
++        self,
++        dir_model: Path,
++        ftype: gguf.LlamaFileType,
++        fname_out: Path,
++        is_big_endian: bool = False,
++        use_temp_file: bool = False,
++        eager: bool = False,
++        metadata_override: Path | None = None,
++        model_name: str | None = None,
++        split_max_tensors: int = 0,
++        split_max_size: int = 0,
++        dry_run: bool = False,
++        small_first_shard: bool = False,
++        hparams: dict[str, Any] | None = None,
++    ):
++        if type(self) is Model:
++            raise TypeError(
++                f"{type(self).__name__!r} should not be directly instantiated"
++            )
++
++        self.dir_model = dir_model
++        self.ftype = ftype
++        self.fname_out = fname_out
++        self.is_big_endian = is_big_endian
++        self.endianess = (
++            gguf.GGUFEndian.BIG if is_big_endian else gguf.GGUFEndian.LITTLE
++        )
++        self.use_temp_file = use_temp_file
++        self.lazy = not eager
++        self.part_names = Model.get_model_part_names(
++            self.dir_model, "model", ".safetensors"
++        )
++        self.is_safetensors = len(self.part_names) > 0
++        if not self.is_safetensors:
++            self.part_names = Model.get_model_part_names(
++                self.dir_model, "pytorch_model", ".bin"
++            )
++        self.hparams = (
++            Model.load_hparams(self.dir_model) if hparams is None else hparams
++        )
++        self.block_count = self.find_hparam(
++            ["n_layers", "num_hidden_layers", "n_layer", "num_layers"]
++        )
++        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
++        self.tensor_names = None
++        self.metadata_override = metadata_override
++        self.model_name = model_name
++        self.dir_model_card = dir_model  # overridden in convert_lora_to_gguf.py
++
++        # Apply heuristics to figure out typical tensor encoding based on first layer tensor encoding type
++
++        # Configure GGUF Writer
++        self.gguf_writer = gguf.GGUFWriter(
++            path=None,
++            arch=gguf.MODEL_ARCH_NAMES[self.model_arch],
++            endianess=self.endianess,
++            use_temp_file=self.use_temp_file,
++            split_max_tensors=split_max_tensors,
++            split_max_size=split_max_size,
++            dry_run=dry_run,
++            small_first_shard=small_first_shard,
++        )
++
++    @classmethod
++    def __init_subclass__(cls):
++        # can't use an abstract property, because overriding it without type errors
++        # would require using decorated functions instead of simply defining the property
++        if "model_arch" not in cls.__dict__:
++            raise TypeError(f"Missing property 'model_arch' for {cls.__name__!r}")
++
++    def find_hparam(self, keys: Iterable[str], optional: bool = False) -> Any:
++        key = next((k for k in keys if k in self.hparams), None)
++        if key is not None:
++            return self.hparams[key]
++        if optional:
++            return None
++        raise KeyError(f"could not find any of: {keys}")
++
++    def set_vocab(self):
++        self._set_vocab_gpt2()
++
++    def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
++        tensor_names_from_parts: set[str] = set()
++
++        index_name = "model.safetensors" if self.is_safetensors else "pytorch_model.bin"
++        index_name += ".index.json"
++        index_file = self.dir_model / index_name
++
++        if index_file.is_file():
++            self.tensor_names = set()
++            logger.info(f"gguf: loading model weight map from '{index_name}'")
++            with open(index_file, "r", encoding="utf-8") as f:
++                index: dict[str, Any] = json.load(f)
++                weight_map = index.get("weight_map")
++                if weight_map is None or not isinstance(weight_map, dict):
++                    raise ValueError(f"Can't load 'weight_map' from {index_name!r}")
++                self.tensor_names.update(weight_map.keys())
++        else:
++            self.tensor_names = tensor_names_from_parts
++            weight_map = {}
++
++        for part_name in self.part_names:
++            logger.info(f"gguf: loading model part '{part_name}'")
++            ctx: ContextManager[Any]
++            if self.is_safetensors:
++                from safetensors import safe_open
++
++                ctx = cast(
++                    ContextManager[Any],
++                    safe_open(self.dir_model / part_name, framework="pt", device="cpu"),
++                )
++            else:
++                ctx = contextlib.nullcontext(
++                    torch.load(
++                        str(self.dir_model / part_name),
++                        map_location="cpu",
++                        mmap=True,
++                        weights_only=True,
++                    )
++                )
++
++            with ctx as model_part:
++                tensor_names_from_parts.update(model_part.keys())
++
++                for name in model_part.keys():
++                    if self.is_safetensors:
++                        if self.lazy:
++                            data = model_part.get_slice(name)
++                            data = LazyTorchTensor.from_safetensors_slice(data)
++                        else:
++                            data = model_part.get_tensor(name)
++                    else:
++                        data = model_part[name]
++                        if self.lazy:
++                            data = LazyTorchTensor.from_eager(data)
++                    yield name, data
++
++        # verify tensor name presence and identify potentially missing files
++        if len(tensor_names_from_parts.symmetric_difference(self.tensor_names)) > 0:
++            missing = sorted(self.tensor_names.difference(tensor_names_from_parts))
++            extra = sorted(tensor_names_from_parts.difference(self.tensor_names))
++            missing_files = sorted(
++                set(weight_map[n] for n in missing if n in weight_map)
++            )
++            if len(extra) == 0 and len(missing_files) > 0:
++                raise ValueError(
++                    f"Missing or incomplete model files: {missing_files}\n"
++                    f"Missing tensors: {missing}"
++                )
++            else:
++                raise ValueError(
++                    "Mismatch between weight map and model parts for tensor names:\n"
++                    f"Missing tensors: {missing}\n"
++                    f"Extra tensors: {extra}"
++                )
++
++    def format_tensor_name(
++        self, key: gguf.MODEL_TENSOR, bid: int | None = None, suffix: str = ".weight"
++    ) -> str:
++        if key not in gguf.MODEL_TENSORS[self.model_arch]:
++            raise ValueError(
++                f"Missing {key!r} for MODEL_TENSORS of {self.model_arch!r}"
++            )
++        name: str = gguf.TENSOR_NAMES[key]
++        if "{bid}" in name:
++            assert bid is not None
++            name = name.format(bid=bid)
++        return name + suffix
++
++    def match_model_tensor_name(
++        self,
++        name: str,
++        key: gguf.MODEL_TENSOR,
++        bid: int | None,
++        suffix: str = ".weight",
++    ) -> bool:
++        if key not in gguf.MODEL_TENSORS[self.model_arch]:
++            return False
++        key_name: str = gguf.TENSOR_NAMES[key]
++        if "{bid}" in key_name:
++            if bid is None:
++                return False
++            key_name = key_name.format(bid=bid)
++        else:
++            if bid is not None:
++                return False
++        return name == (key_name + suffix)
++
++    def map_tensor_name(
++        self, name: str, try_suffixes: Sequence[str] = (".weight", ".bias")
++    ) -> str:
++        new_name = self.tensor_map.get_name(key=name, try_suffixes=try_suffixes)
++        if new_name is None:
++            raise ValueError(f"Can not map tensor {name!r}")
++        return new_name
++
++    def set_gguf_parameters(self):
++        self.gguf_writer.add_block_count(self.block_count)
++
++        if (
++            n_ctx := self.find_hparam(
++                ["max_position_embeddings", "n_ctx"], optional=True
++            )
++        ) is not None:
++            self.gguf_writer.add_context_length(n_ctx)
++            logger.info(f"gguf: context length = {n_ctx}")
++
++        if (
++            n_embd := self.find_hparam(["hidden_size", "n_embd"], optional=True)
++        ) is not None:
++            self.gguf_writer.add_embedding_length(n_embd)
++            logger.info(f"gguf: embedding length = {n_embd}")
++
++        if (
++            n_ff := self.find_hparam(["intermediate_size", "n_inner"], optional=True)
++        ) is not None:
++            self.gguf_writer.add_feed_forward_length(n_ff)
++            logger.info(f"gguf: feed forward length = {n_ff}")
++
++        if (
++            n_head := self.find_hparam(["num_attention_heads", "n_head"], optional=True)
++        ) is not None:
++            self.gguf_writer.add_head_count(n_head)
++            logger.info(f"gguf: head count = {n_head}")
++
++        if (n_head_kv := self.hparams.get("num_key_value_heads")) is not None:
++            self.gguf_writer.add_head_count_kv(n_head_kv)
++            logger.info(f"gguf: key-value head count = {n_head_kv}")
++
++        if (rope_theta := self.hparams.get("rope_theta")) is not None:
++            self.gguf_writer.add_rope_freq_base(rope_theta)
++            logger.info(f"gguf: rope theta = {rope_theta}")
++        if (f_rms_eps := self.hparams.get("rms_norm_eps")) is not None:
++            self.gguf_writer.add_layer_norm_rms_eps(f_rms_eps)
++            logger.info(f"gguf: rms norm epsilon = {f_rms_eps}")
++        if (
++            f_norm_eps := self.find_hparam(
++                ["layer_norm_eps", "layer_norm_epsilon", "norm_epsilon"], optional=True
++            )
++        ) is not None:
++            self.gguf_writer.add_layer_norm_eps(f_norm_eps)
++            logger.info(f"gguf: layer norm epsilon = {f_norm_eps}")
++        if (n_experts := self.hparams.get("num_local_experts")) is not None:
++            self.gguf_writer.add_expert_count(n_experts)
++            logger.info(f"gguf: expert count = {n_experts}")
++        if (n_experts_used := self.hparams.get("num_experts_per_tok")) is not None:
++            self.gguf_writer.add_expert_used_count(n_experts_used)
++            logger.info(f"gguf: experts used count = {n_experts_used}")
++
++        if (head_dim := self.hparams.get("head_dim")) is not None:
++            self.gguf_writer.add_key_length(head_dim)
++            self.gguf_writer.add_value_length(head_dim)
++
++        self.gguf_writer.add_file_type(self.ftype)
++        logger.info(f"gguf: file type = {self.ftype}")
++
++    def modify_tensors(
++        self, data_torch: Tensor, name: str, bid: int | None
++    ) -> Iterable[tuple[str, Tensor]]:
++        del bid  # unused
++
++        return [(self.map_tensor_name(name), data_torch)]
++
++    def tensor_force_quant(
++        self, name: str, new_name: str, bid: int | None, n_dims: int
++    ) -> gguf.GGMLQuantizationType | bool:
++        del name, new_name, bid, n_dims  # unused
++
++        return False
++
++    # some models need extra generated tensors (like rope_freqs)
++    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
++        return ()
++
++    def prepare_tensors(self):
++        max_name_len = max(len(s) for _, s in self.tensor_map.mapping.values()) + len(
++            ".weight,"
++        )
++        for name, data_torch in chain(
++            self.generate_extra_tensors(), self.get_tensors()
++        ):
++            # we don't need these
++            if name.endswith(
++                (".attention.masked_bias", ".attention.bias", ".rotary_emb.inv_freq")
++            ):
++                continue
++
++            old_dtype = data_torch.dtype
++            logger.info(f"gguf: processing tensor '{name}', dtype = {old_dtype}")
++            # convert any unsupported data types to float32
++            if data_torch.dtype not in (torch.float16, torch.float32):
++                data_torch = data_torch.to(torch.float32)
++
++            # use the first number-like part of the tensor name as the block id
++            bid = None
++            for part in name.split("."):
++                if part.isdecimal():
++                    bid = int(part)
++                    break
++
++            for new_name, data_torch in self.modify_tensors(data_torch, name, bid):
++                # TODO: why do we squeeze here?
++                # data = data_torch.squeeze().numpy()
++                data = data_torch.numpy()
++
++                # if data ends up empty, it means data_torch was a scalar tensor -> restore
++                if len(data.shape) == 0:
++                    data = data_torch.numpy()
++
++                n_dims = len(data.shape)
++                data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(
++                    name, new_name, bid, n_dims
++                )
++
++                # Most of the codebase that takes in 1D tensors or norms only handles F32 tensors
++                if n_dims <= 1 or new_name.endswith("_norm.weight"):
++                    data_qtype = gguf.GGMLQuantizationType.F32
++
++                # Conditions should closely match those in llama_model_quantize_internal in llama.cpp
++                # Some tensor types are always in float32
++                if data_qtype is False and (
++                    any(
++                        self.match_model_tensor_name(new_name, key, bid)
++                        for key in (
++                            gguf.MODEL_TENSOR.FFN_GATE_INP,
++                            gguf.MODEL_TENSOR.POS_EMBD,
++                            gguf.MODEL_TENSOR.TOKEN_TYPES,
++                            gguf.MODEL_TENSOR.SSM_CONV1D,
++                            gguf.MODEL_TENSOR.TIME_MIX_FIRST,
++                            gguf.MODEL_TENSOR.TIME_MIX_W1,
++                            gguf.MODEL_TENSOR.TIME_MIX_W2,
++                            gguf.MODEL_TENSOR.TIME_MIX_DECAY_W1,
++                            gguf.MODEL_TENSOR.TIME_MIX_DECAY_W2,
++                            gguf.MODEL_TENSOR.TIME_MIX_LERP_FUSED,
++                            gguf.MODEL_TENSOR.POSNET_NORM1,
++                            gguf.MODEL_TENSOR.POSNET_NORM2,
++                        )
++                    )
++                    or not new_name.endswith(".weight")
++                ):
++                    data_qtype = gguf.GGMLQuantizationType.F32
++
++                if data_qtype is False and any(
++                    self.match_model_tensor_name(new_name, key, bid)
++                    for key in (
++                        gguf.MODEL_TENSOR.TOKEN_EMBD,
++                        gguf.MODEL_TENSOR.OUTPUT,
++                    )
++                ):
++                    if self.ftype in (
++                        gguf.LlamaFileType.MOSTLY_TQ1_0,
++                        gguf.LlamaFileType.MOSTLY_TQ2_0,
++                    ):
++                        # TODO: use Q4_K and Q6_K
++                        data_qtype = gguf.GGMLQuantizationType.F16
++
++                # No override (data_qtype is False), or wants to be quantized (data_qtype is True)
++                if isinstance(data_qtype, bool):
++                    if self.ftype == gguf.LlamaFileType.ALL_F32:
++                        data_qtype = gguf.GGMLQuantizationType.F32
++                    elif self.ftype == gguf.LlamaFileType.MOSTLY_F16:
++                        data_qtype = gguf.GGMLQuantizationType.F16
++                    elif self.ftype == gguf.LlamaFileType.MOSTLY_BF16:
++                        data_qtype = gguf.GGMLQuantizationType.BF16
++                    elif self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0:
++                        data_qtype = gguf.GGMLQuantizationType.Q8_0
++                    elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ1_0:
++                        data_qtype = gguf.GGMLQuantizationType.TQ1_0
++                    elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ2_0:
++                        data_qtype = gguf.GGMLQuantizationType.TQ2_0
++                    else:
++                        raise ValueError(f"Unknown file type: {self.ftype.name}")
++
++                try:
++                    data = gguf.quants.quantize(data, data_qtype)
++                except gguf.QuantError as e:
++                    logger.warning("%s, %s", e, "falling back to F16")
++                    data_qtype = gguf.GGMLQuantizationType.F16
++                    data = gguf.quants.quantize(data, data_qtype)
++
++                shape = (
++                    gguf.quant_shape_from_byte_shape(data.shape, data_qtype)
++                    if data.dtype == np.uint8
++                    else data.shape
++                )
++
++                # reverse shape to make it similar to the internal ggml dimension order
++                shape_str = f"{{{', '.join(str(n) for n in reversed(shape))}}}"
++
++                # n_dims is implicit in the shape
++                logger.info(
++                    f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> {data_qtype.name}, shape = {shape_str}"
++                )
++
++                self.gguf_writer.add_tensor(new_name, data, raw_dtype=data_qtype)
++
++    def set_type(self):
++        self.gguf_writer.add_type(gguf.GGUFType.MODEL)
++
++    def prepare_metadata(self, vocab_only: bool):
++
++        total_params, shared_params, expert_params, expert_count = (
++            self.gguf_writer.get_total_parameter_count()
++        )
++
++        self.metadata = gguf.Metadata.load(
++            self.metadata_override, self.dir_model_card, self.model_name, total_params
++        )
++
++        # Fallback to model directory name if metadata name is still missing
++        if self.metadata.name is None:
++            self.metadata.name = self.dir_model.name
++
++        # Generate parameter weight class (useful for leader boards) if not yet determined
++        if self.metadata.size_label is None and total_params > 0:
++            self.metadata.size_label = gguf.size_label(
++                total_params, shared_params, expert_params, expert_count
++            )
++
++        # Extract the encoding scheme from the file type name. e.g. 'gguf.LlamaFileType.MOSTLY_Q8_0' --> 'Q8_0'
++        output_type: str = self.ftype.name.partition("_")[2]
++
++        # Filename Output
++        if self.fname_out.is_dir():
++            # Generate default filename based on model specification and available metadata
++            if not vocab_only:
++                fname_default: str = gguf.naming_convention(
++                    self.metadata.name,
++                    self.metadata.basename,
++                    self.metadata.finetune,
++                    self.metadata.version,
++                    self.metadata.size_label,
++                    output_type,
++                    model_type="LoRA" if total_params < 0 else None,
++                )
++            else:
++                fname_default: str = gguf.naming_convention(
++                    self.metadata.name,
++                    self.metadata.basename,
++                    self.metadata.finetune,
++                    self.metadata.version,
++                    size_label=None,
++                    output_type=None,
++                    model_type="vocab",
++                )
++
++            # Use the default filename
++            self.fname_out = self.fname_out / f"{fname_default}.gguf"
++        else:
++            # Output path is a custom defined templated filename
++            # Note: `not is_dir()` is used because `.is_file()` will not detect
++            #       file template strings as it doesn't actually exist as a file
++
++            # Process templated file name with the output ftype, useful with the "auto" ftype
++            self.fname_out = self.fname_out.parent / gguf.fill_templated_filename(
++                self.fname_out.name, output_type
++            )
++
++        self.set_type()
++
++        logger.info("Set meta model")
++        self.metadata.set_gguf_meta_model(self.gguf_writer)
++
++        logger.info("Set model parameters")
++        self.set_gguf_parameters()
++
++        logger.info("Set model tokenizer")
++        self.set_vocab()
++
++        logger.info("Set model quantization version")
++        self.gguf_writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
++
++    def write(self):
++        self.prepare_tensors()
++        self.prepare_metadata(vocab_only=False)
++        self.gguf_writer.write_header_to_file(path=self.fname_out)
++        self.gguf_writer.write_kv_data_to_file()
++        self.gguf_writer.write_tensors_to_file(progress=True)
++        self.gguf_writer.close()
++
++    def write_vocab(self):
++        if len(self.gguf_writer.tensors) != 1:
++            raise ValueError("Splitting the vocabulary is not supported")
++
++        self.prepare_metadata(vocab_only=True)
++        self.gguf_writer.write_header_to_file(path=self.fname_out)
++        self.gguf_writer.write_kv_data_to_file()
++        self.gguf_writer.close()
++
++    @staticmethod
++    def get_model_part_names(dir_model: Path, prefix: str, suffix: str) -> list[str]:
++        part_names: list[str] = []
++        for filename in os.listdir(dir_model):
++            if filename.startswith(prefix) and filename.endswith(suffix):
++                part_names.append(filename)
++
++        part_names.sort()
++
++        return part_names
++
++    @staticmethod
++    def load_hparams(dir_model: Path):
++        with open(dir_model / "config.json", "r", encoding="utf-8") as f:
++            return json.load(f)
++
++    @classmethod
++    def register(cls, *names: str) -> Callable[[AnyModel], AnyModel]:
++        assert names
++
++        def func(modelcls: AnyModel) -> AnyModel:
++            for name in names:
++                cls._model_classes[name] = modelcls
++            return modelcls
++
++        return func
++
++    @classmethod
++    def print_registered_models(cls):
++        for name in sorted(cls._model_classes.keys()):
++            logger.error(f"- {name}")
++
++    @classmethod
++    def from_model_architecture(cls, arch: str) -> type[Model]:
++        try:
++            return cls._model_classes[arch]
++        except KeyError:
++            raise NotImplementedError(f"Architecture {arch!r} not supported!") from None
++
++    def does_token_look_special(self, token: str | bytes) -> bool:
++        if isinstance(token, (bytes, bytearray)):
++            token_text = token.decode(encoding="utf-8")
++        elif isinstance(token, memoryview):
++            token_text = token.tobytes().decode(encoding="utf-8")
++        else:
++            token_text = token
++
++        # Some models mark some added tokens which ought to be control tokens as not special.
++        # (e.g. command-r, command-r-plus, deepseek-coder, gemma{,-2})
++        seems_special = token_text in (
++            "<pad>",  # deepseek-coder
++            "<mask>",
++            "<2mass>",
++            "[@BOS@]",  # gemma{,-2}
++        )
++
++        seems_special = seems_special or (
++            token_text.startswith("<|") and token_text.endswith("|>")
++        )
++        seems_special = seems_special or (
++            token_text.startswith("<｜") and token_text.endswith("｜>")
++        )  # deepseek-coder
++
++        # TODO: should these be marked as UNUSED instead? (maybe not)
++        seems_special = seems_special or (
++            token_text.startswith("<unused") and token_text.endswith(">")
++        )  # gemma{,-2}
++
++        return seems_special
++
++    # used for GPT-2 BPE and WordPiece vocabs
++    def get_vocab_base(self) -> tuple[list[str], list[int], str]:
++        tokens: list[str] = []
++        toktypes: list[int] = []
++
++        from transformers import AutoTokenizer
++
++        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
++        vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))
++        assert max(tokenizer.vocab.values()) < vocab_size
++
++        tokpre = self.get_vocab_base_pre(tokenizer)
++
++        reverse_vocab = {
++            id_: encoded_tok for encoded_tok, id_ in tokenizer.vocab.items()
++        }
++        added_vocab = tokenizer.get_added_vocab()
++
++        added_tokens_decoder = tokenizer.added_tokens_decoder
++
++        for i in range(vocab_size):
++            if i not in reverse_vocab:
++                tokens.append(f"[PAD{i}]")
++                toktypes.append(gguf.TokenType.UNUSED)
++            else:
++                token: str = reverse_vocab[i]
++                if token in added_vocab:
++                    # The tokenizer in llama.cpp assumes the CONTROL and USER_DEFINED tokens are pre-normalized.
++                    # To avoid unexpected issues - we make sure to normalize non-normalized tokens
++                    if not added_tokens_decoder[i].normalized:
++                        previous_token = token
++                        token = tokenizer.decode(
++                            tokenizer.encode(token, add_special_tokens=False)
++                        )
++                        if previous_token != token:
++                            logger.info(
++                                f"{repr(previous_token)} is encoded and decoded back to {repr(token)} using AutoTokenizer"
++                            )
++
++                    if added_tokens_decoder[i].special or self.does_token_look_special(
++                        token
++                    ):
++                        toktypes.append(gguf.TokenType.CONTROL)
++                    else:
++                        # NOTE: this was added for Gemma.
++                        # Encoding and decoding the tokens above isn't sufficient for this case.
++                        token = token.replace(
++                            b"\xe2\x96\x81".decode("utf-8"), " "
++                        )  # pre-normalize user-defined spaces
++                        toktypes.append(gguf.TokenType.USER_DEFINED)
++                else:
++                    toktypes.append(gguf.TokenType.NORMAL)
++                tokens.append(token)
++
++        return tokens, toktypes, tokpre
++
++    # NOTE: this function is generated by convert_hf_to_gguf_update.py
++    #       do not modify it manually!
++    # ref:  https://github.com/ggml-org/llama.cpp/pull/6920
++    # Marker: Start get_vocab_base_pre
++    def get_vocab_base_pre(self, tokenizer) -> str:
++        # encoding this string and hashing the resulting tokens would (hopefully) give us a unique identifier that
++        # is specific for the BPE pre-tokenizer used by the model
++        # we will use this unique identifier to write a "tokenizer.ggml.pre" entry in the GGUF file which we can
++        # use in llama.cpp to implement the same pre-tokenizer
++
++        chktxt = "\n \n\n \n\n\n \t \t\t \t\n  \n   \n    \n     \n🚀 (normal) 😶\u200d🌫️ (multiple emojis concatenated) ✅ 🦙🦙 3 33 333 3333 33333 333333 3333333 33333333 3.3 3..3 3...3 កាន់តែពិសេសអាច😁 ?我想在apple工作1314151天～ ------======= нещо на Български ''''''```````\"\"\"\"......!!!!!!?????? I've been 'told he's there, 'RE you sure? 'M not sure I'll make it, 'D you like some tea? We'Ve a'lL"
++
++        chktok = tokenizer.encode(chktxt)
++        chkhsh = sha256(str(chktok).encode()).hexdigest()
++
++        logger.debug(f"chktok: {chktok}")
++        logger.debug(f"chkhsh: {chkhsh}")
++
++        res = None
++
++        # NOTE: if you get an error here, you need to update the convert_hf_to_gguf_update.py script
++        #       or pull the latest version of the model from Huggingface
++        #       don't edit the hashes manually!
++        if chkhsh == "0ef9807a4087ebef797fc749390439009c3b9eda9ad1a097abbe738f486c01e5":
++            # ref: https://huggingface.co/meta-llama/Meta-Llama-3-8B
++            res = "llama-bpe"
++        if chkhsh == "049ecf7629871e3041641907f3de7c733e4dbfdc736f57d882ba0b0845599754":
++            # ref: https://huggingface.co/deepseek-ai/deepseek-llm-7b-base
++            res = "deepseek-llm"
++        if chkhsh == "347715f544604f9118bb75ed199f68779f423cabb20db6de6f31b908d04d7821":
++            # ref: https://huggingface.co/deepseek-ai/deepseek-coder-6.7b-base
++            res = "deepseek-coder"
++        if chkhsh == "8aeee3860c56296a157a1fe2fad249ec40aa59b1bb5709f4ade11c4e6fe652ed":
++            # ref: https://huggingface.co/tiiuae/falcon-7b
++            res = "falcon"
++        if chkhsh == "9d032fcbd5501f4a38150912590928bfb36091efb5df11b8e2124b0390e3fb1e":
++            # ref: https://huggingface.co/tiiuae/Falcon3-7B-Base
++            res = "falcon3"
++        if chkhsh == "0876d13b50744004aa9aeae05e7b0647eac9d801b5ba4668afc01e709c15e19f":
++            # ref: https://huggingface.co/BAAI/bge-small-en-v1.5
++            res = "bert-bge"
++        if chkhsh == "8e62295832751ca1e8f92f2226f403dea30dc5165e448b5bfa05af5340c64ec7":
++            # ref: https://huggingface.co/BAAI/bge-large-zh-v1.5
++            res = "bert-bge-large"
++        if chkhsh == "b6dc8df998e1cfbdc4eac8243701a65afe638679230920b50d6f17d81c098166":
++            # ref: https://huggingface.co/mosaicml/mpt-7b
++            res = "mpt"
++        if chkhsh == "35d91631860c815f952d711435f48d356ebac988362536bed955d43bfa436e34":
++            # ref: https://huggingface.co/bigcode/starcoder2-3b
++            res = "starcoder"
++        if chkhsh == "3ce83efda5659b07b1ad37ca97ca5797ea4285d9b9ab0dc679e4a720c9da7454":
++            # ref: https://huggingface.co/openai-community/gpt2
++            res = "gpt-2"
++        if chkhsh == "32d85c31273f8019248f2559fed492d929ea28b17e51d81d3bb36fff23ca72b3":
++            # ref: https://huggingface.co/stabilityai/stablelm-2-zephyr-1_6b
++            res = "stablelm2"
++        if chkhsh == "6221ad2852e85ce96f791f476e0b390cf9b474c9e3d1362f53a24a06dc8220ff":
++            # ref: https://huggingface.co/smallcloudai/Refact-1_6-base
++            res = "refact"
++        if chkhsh == "9c2227e4dd922002fb81bde4fc02b0483ca4f12911410dee2255e4987644e3f8":
++            # ref: https://huggingface.co/CohereForAI/c4ai-command-r-v01
++            res = "command-r"
++        if chkhsh == "e636dc30a262dcc0d8c323492e32ae2b70728f4df7dfe9737d9f920a282b8aea":
++            # ref: https://huggingface.co/Qwen/Qwen1.5-7B
++            res = "qwen2"
++        if chkhsh == "b6dc8df998e1cfbdc4eac8243701a65afe638679230920b50d6f17d81c098166":
++            # ref: https://huggingface.co/allenai/OLMo-1.7-7B-hf
++            res = "olmo"
++        if chkhsh == "a8594e3edff7c29c003940395316294b2c623e09894deebbc65f33f1515df79e":
++            # ref: https://huggingface.co/databricks/dbrx-base
++            res = "dbrx"
++        if chkhsh == "c7699093ba4255a91e702aa38a596aa81669f3525dae06c2953267dde580f448":
++            # ref: https://huggingface.co/jinaai/jina-reranker-v1-tiny-en
++            res = "jina-v1-en"
++        if chkhsh == "0876d13b50744004aa9aeae05e7b0647eac9d801b5ba4668afc01e709c15e19f":
++            # ref: https://huggingface.co/jinaai/jina-embeddings-v2-base-en
++            res = "jina-v2-en"
++        if chkhsh == "171aeeedd6fb548d418a7461d053f11b6f1f1fc9b387bd66640d28a4b9f5c643":
++            # ref: https://huggingface.co/jinaai/jina-embeddings-v2-base-es
++            res = "jina-v2-es"
++        if chkhsh == "27949a2493fc4a9f53f5b9b029c82689cfbe5d3a1929bb25e043089e28466de6":
++            # ref: https://huggingface.co/jinaai/jina-embeddings-v2-base-de
++            res = "jina-v2-de"
++        if chkhsh == "c136ed14d01c2745d4f60a9596ae66800e2b61fa45643e72436041855ad4089d":
++            # ref: https://huggingface.co/abacusai/Smaug-Llama-3-70B-Instruct
++            res = "smaug-bpe"
++        if chkhsh == "c7ea5862a53e4272c035c8238367063e2b270d51faa48c0f09e9d5b54746c360":
++            # ref: https://huggingface.co/LumiOpen/Poro-34B-chat
++            res = "poro-chat"
++        if chkhsh == "7967bfa498ade6b757b064f31e964dddbb80f8f9a4d68d4ba7998fcf281c531a":
++            # ref: https://huggingface.co/jinaai/jina-embeddings-v2-base-code
++            res = "jina-v2-code"
++        if (
++            chkhsh == "b6e8e1518dc4305be2fe39c313ed643381c4da5db34a98f6a04c093f8afbe99b"
++            or chkhsh
++            == "81d72c7348a9f0ebe86f23298d37debe0a5e71149e29bd283904c02262b27516"
++        ):
++            # ref: https://huggingface.co/THUDM/glm-4-9b-chat
++            res = "chatglm-bpe"
++        if chkhsh == "7fc505bd3104ca1083b150b17d088b59534ede9bde81f0dd2090967d7fe52cee":
++            # ref: https://huggingface.co/LumiOpen/Viking-7B
++            res = "viking"
++        if chkhsh == "b53802fb28e26d645c3a310b34bfe07da813026ec7c7716883404d5e0f8b1901":
++            # ref: https://huggingface.co/core42/jais-13b
++            res = "jais"
++        if chkhsh == "7b3e7548e4308f52a76e8229e4e6cc831195d0d1df43aed21ac6c93da05fec5f":
++            # ref: https://huggingface.co/WisdomShell/CodeShell-7B
++            res = "codeshell"
++        if chkhsh == "63b97e4253352e6f357cc59ea5b583e3a680eaeaf2632188c2b952de2588485e":
++            # ref: https://huggingface.co/mistralai/Mistral-Nemo-Base-2407
++            res = "tekken"
++        if chkhsh == "855059429035d75a914d1eda9f10a876752e281a054a7a3d421ef0533e5b6249":
++            # ref: https://huggingface.co/HuggingFaceTB/SmolLM-135M
++            res = "smollm"
++        if chkhsh == "3c30d3ad1d6b64202cd222813e7736c2db6e1bd6d67197090fc1211fbc612ae7":
++            # ref: https://huggingface.co/bigscience/bloom
++            res = "bloom"
++        if chkhsh == "bc01ce58980e1db43859146dc51b1758b3b88729b217a74792e9f8d43e479d21":
++            # ref: https://huggingface.co/TurkuNLP/gpt3-finnish-small
++            res = "gpt3-finnish"
++        if chkhsh == "4e2b24cc4770243d65a2c9ec19770a72f08cffc161adbb73fcbb6b7dd45a0aae":
++            # ref: https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct
++            res = "exaone"
++        if chkhsh == "fcace8b9cac38ce847670c970cd5892031a753a1ef381abd1d9af00f713da085":
++            # ref: https://huggingface.co/microsoft/phi-2
++            res = "phi-2"
++        if chkhsh == "60824e3c0d9401f89943cbb2fff727f0e2d4c545ba4df2d6e4f09a6db0f5b450":
++            # ref: https://huggingface.co/facebook/chameleon-7b
++            res = "chameleon"
++        if chkhsh == "1431a23e583c97432bc230bff598d103ddb5a1f89960c8f1d1051aaa944d0b35":
++            # ref: https://huggingface.co/sapienzanlp/Minerva-7B-base-v1.0
++            res = "minerva-7b"
++        if chkhsh == "8b5a93ed704057481f240da0be7e7dca721d7f8f4755263b6807227a2cbeae65":
++            # ref: https://huggingface.co/sentence-transformers/stsb-roberta-base
++            res = "roberta-bpe"
++        if chkhsh == "ad851be1dba641f2e3711822f816db2c265f788b37c63b4e1aeacb9ee92de8eb":
++            # ref: https://huggingface.co/ai-sage/GigaChat-20B-A3B-instruct
++            res = "gigachat"
++        if chkhsh == "d4c8f286ea6b520b3d495c4455483cfa2302c0cfcd4be05d781b6a8a0a7cdaf1":
++            # ref: https://huggingface.co/Infinigence/Megrez-3B-Instruct
++            res = "megrez"
++        if chkhsh == "877081d19cf6996e2c4ff0e1236341e9b7bde288f5311a56a937f0afbbb3aeb5":
++            # ref: https://huggingface.co/deepseek-ai/DeepSeek-V3
++            res = "deepseek-v3"
++        if chkhsh == "b3f499bb4255f8ca19fccd664443283318f2fd2414d5e0b040fbdd0cc195d6c5":
++            # ref: https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
++            res = "deepseek-r1-qwen"
++        if chkhsh == "ccc2ef013c104be7bae2965776d611e1d7a8a2a9c547dd93a682c9a9fc80352e":
++            # ref: https://huggingface.co/Xenova/gpt-4o
++            res = "gpt-4o"
++        if chkhsh == "7dec86086fcc38b66b7bc1575a160ae21cf705be7718b9d5598190d7c12db76f":
++            # ref: https://huggingface.co/UW/OLMo2-8B-SuperBPE-t180k
++            res = "superbpe"
++
++        if res is None:
++            logger.warning("\n")
++            logger.warning(
++                "**************************************************************************************"
++            )
++            logger.warning("** WARNING: The BPE pre-tokenizer was not recognized!")
++            logger.warning("**          There are 2 possible reasons for this:")
++            logger.warning(
++                "**          - the model has not been added to convert_hf_to_gguf_update.py yet"
++            )
++            logger.warning(
++                "**          - the pre-tokenization config has changed upstream"
++            )
++            logger.warning(
++                "**          Check your model files and convert_hf_to_gguf_update.py and update them accordingly."
++            )
++            logger.warning(
++                "** ref:     https://github.com/ggml-org/llama.cpp/pull/6920"
++            )
++            logger.warning("**")
++            logger.warning(f"** chkhsh:  {chkhsh}")
++            logger.warning(
++                "**************************************************************************************"
++            )
++            logger.warning("\n")
++            raise NotImplementedError(
++                "BPE pre-tokenizer was not recognized - update get_vocab_base_pre()"
++            )
++
++        logger.debug(f"tokenizer.ggml.pre: {repr(res)}")
++        logger.debug(f"chkhsh: {chkhsh}")
++
++        return res
++        # Marker: End get_vocab_base_pre
++
++    def _set_vocab_none(self) -> None:
++        self.gguf_writer.add_tokenizer_model("none")
++
++    def _set_vocab_gpt2(self) -> None:
++        tokens, toktypes, tokpre = self.get_vocab_base()
++        self.gguf_writer.add_tokenizer_model("gpt2")
++        self.gguf_writer.add_tokenizer_pre(tokpre)
++        self.gguf_writer.add_token_list(tokens)
++        self.gguf_writer.add_token_types(toktypes)
++
++        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
++        special_vocab.add_to_gguf(self.gguf_writer)
++
++    def _set_vocab_qwen(self):
++        dir_model = self.dir_model
++        hparams = self.hparams
++        tokens: list[str] = []
++        toktypes: list[int] = []
++
++        from transformers import AutoTokenizer
++
++        tokenizer = AutoTokenizer.from_pretrained(dir_model, trust_remote_code=True)
++        vocab_size = hparams["vocab_size"]
++        assert max(tokenizer.get_vocab().values()) < vocab_size
++
++        tokpre = self.get_vocab_base_pre(tokenizer)
++
++        merges = []
++        vocab = {}
++        mergeable_ranks = tokenizer.mergeable_ranks
++        for token, rank in mergeable_ranks.items():
++            vocab[QwenModel.token_bytes_to_string(token)] = rank
++            if len(token) == 1:
++                continue
++            merged = QwenModel.bpe(mergeable_ranks, token, max_rank=rank)
++            assert len(merged) == 2
++            merges.append(" ".join(map(QwenModel.token_bytes_to_string, merged)))
++
++        # for this kind of tokenizer, added_vocab is not a subset of vocab, so they need to be combined
++        added_vocab = tokenizer.special_tokens
++        reverse_vocab = {
++            id_: encoded_tok for encoded_tok, id_ in {**vocab, **added_vocab}.items()
++        }
++
++        for i in range(vocab_size):
++            if i not in reverse_vocab:
++                tokens.append(f"[PAD{i}]")
++                toktypes.append(gguf.TokenType.UNUSED)
++            elif reverse_vocab[i] in added_vocab:
++                tokens.append(reverse_vocab[i])
++                toktypes.append(gguf.TokenType.CONTROL)
++            else:
++                tokens.append(reverse_vocab[i])
++                toktypes.append(gguf.TokenType.NORMAL)
++
++        self.gguf_writer.add_tokenizer_model("gpt2")
++        self.gguf_writer.add_tokenizer_pre(tokpre)
++        self.gguf_writer.add_token_list(tokens)
++        self.gguf_writer.add_token_types(toktypes)
++
++        special_vocab = gguf.SpecialVocab(dir_model, load_merges=False)
++        special_vocab.merges = merges
++        # only add special tokens when they were not already loaded from config.json
++        if len(special_vocab.special_token_ids) == 0:
++            special_vocab._set_special_token(
++                "bos", tokenizer.special_tokens["<|endoftext|>"]
++            )
++            special_vocab._set_special_token(
++                "eos", tokenizer.special_tokens["<|endoftext|>"]
++            )
++        # this one is usually not in config.json anyway
++        special_vocab._set_special_token(
++            "unk", tokenizer.special_tokens["<|endoftext|>"]
++        )
++        special_vocab.add_to_gguf(self.gguf_writer)
++
++    def _set_vocab_sentencepiece(self, add_to_gguf=True):
++        tokens, scores, toktypes = self._create_vocab_sentencepiece()
++
++        self.gguf_writer.add_tokenizer_model("llama")
++        self.gguf_writer.add_tokenizer_pre("default")
++        self.gguf_writer.add_token_list(tokens)
++        self.gguf_writer.add_token_scores(scores)
++        self.gguf_writer.add_token_types(toktypes)
++
++        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
++        special_vocab.add_to_gguf(self.gguf_writer)
++
++    def _create_vocab_sentencepiece(self):
++        from sentencepiece import SentencePieceProcessor
++
++        tokenizer_path = self.dir_model / "tokenizer.model"
++
++        if not tokenizer_path.is_file():
++            raise FileNotFoundError(f"File not found: {tokenizer_path}")
++
++        tokenizer = SentencePieceProcessor()
++        tokenizer.LoadFromFile(str(tokenizer_path))
++
++        vocab_size = self.hparams.get("vocab_size", tokenizer.vocab_size())
++
++        tokens: list[bytes] = [f"[PAD{i}]".encode("utf-8") for i in range(vocab_size)]
++        scores: list[float] = [-10000.0] * vocab_size
++        toktypes: list[int] = [SentencePieceTokenTypes.UNUSED] * vocab_size
++
++        for token_id in range(tokenizer.vocab_size()):
++            piece = tokenizer.IdToPiece(token_id)
++            text = piece.encode("utf-8")
++            score = tokenizer.GetScore(token_id)
++
++            toktype = SentencePieceTokenTypes.NORMAL
++            if tokenizer.IsUnknown(token_id):
++                toktype = SentencePieceTokenTypes.UNKNOWN
++            elif tokenizer.IsControl(token_id):
++                toktype = SentencePieceTokenTypes.CONTROL
++            elif tokenizer.IsUnused(token_id):
++                toktype = SentencePieceTokenTypes.UNUSED
++            elif tokenizer.IsByte(token_id):
++                toktype = SentencePieceTokenTypes.BYTE
++
++            tokens[token_id] = text
++            scores[token_id] = score
++            toktypes[token_id] = toktype
++
++        added_tokens_file = self.dir_model / "added_tokens.json"
++        if added_tokens_file.is_file():
++            with open(added_tokens_file, "r", encoding="utf-8") as f:
++                added_tokens_json = json.load(f)
++                for key in added_tokens_json:
++                    token_id = added_tokens_json[key]
++                    if token_id >= vocab_size:
++                        logger.warning(
++                            f"ignore token {token_id}: id is out of range, max={vocab_size - 1}"
++                        )
++                        continue
++
++                    tokens[token_id] = key.encode("utf-8")
++                    scores[token_id] = -1000.0
++                    toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
++
++        tokenizer_config_file = self.dir_model / "tokenizer_config.json"
++        if tokenizer_config_file.is_file():
++            with open(tokenizer_config_file, "r", encoding="utf-8") as f:
++                tokenizer_config_json = json.load(f)
++                added_tokens_decoder = tokenizer_config_json.get(
++                    "added_tokens_decoder", {}
++                )
++                for token_id, token_data in added_tokens_decoder.items():
++                    token_id = int(token_id)
++                    token: str = token_data["content"]
++                    if token_id >= vocab_size:
++                        logger.warning(
++                            f"ignore token {token_id}: id is out of range, max={vocab_size - 1}"
++                        )
++                        continue
++                    if toktypes[token_id] != SentencePieceTokenTypes.UNUSED:
++                        if tokens[token_id] != token.encode("utf-8"):
++                            logger.warning(
++                                f'replacing token {token_id}: {tokens[token_id].decode("utf-8")!r} -> {token!r}'
++                            )
++                    if token_data.get("special") or self.does_token_look_special(token):
++                        toktypes[token_id] = SentencePieceTokenTypes.CONTROL
++                    else:
++                        token = token.replace(
++                            b"\xe2\x96\x81".decode("utf-8"), " "
++                        )  # pre-normalize user-defined spaces
++                        toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
++
++                    scores[token_id] = -1000.0
++                    tokens[token_id] = token.encode("utf-8")
++
++        if vocab_size > len(tokens):
++            pad_count = vocab_size - len(tokens)
++            logger.debug(
++                f"Padding vocab with {pad_count} token(s) - [PAD1] through [PAD{pad_count}]"
++            )
++            for i in range(1, pad_count + 1):
++                tokens.append(bytes(f"[PAD{i}]", encoding="utf-8"))
++                scores.append(-1000.0)
++                toktypes.append(SentencePieceTokenTypes.UNUSED)
++
++        return tokens, scores, toktypes
++
++    def _set_vocab_llama_hf(self):
++        vocab = gguf.LlamaHfVocab(self.dir_model)
++        tokens = []
++        scores = []
++        toktypes = []
++
++        for text, score, toktype in vocab.all_tokens():
++            tokens.append(text)
++            scores.append(score)
++            toktypes.append(toktype)
++
++        assert len(tokens) == vocab.vocab_size
++
++        self.gguf_writer.add_tokenizer_model("llama")
++        self.gguf_writer.add_tokenizer_pre("default")
++        self.gguf_writer.add_token_list(tokens)
++        self.gguf_writer.add_token_scores(scores)
++        self.gguf_writer.add_token_types(toktypes)
++
++        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
++        special_vocab.add_to_gguf(self.gguf_writer)
++
++    def _set_vocab_rwkv_world(self):
++        assert (self.dir_model / "rwkv_vocab_v20230424.txt").is_file()
++        vocab_size = self.hparams.get("vocab_size", 65536)
++
++        tokens: list[bytes] = ["<s>".encode("utf-8")]
++        toktypes: list[int] = [gguf.TokenType.CONTROL]
++
++        with open(
++            self.dir_model / "rwkv_vocab_v20230424.txt", "r", encoding="utf-8"
++        ) as f:
++            lines = f.readlines()
++            for line in lines:
++                parts = line.split(" ")
++                assert len(parts) >= 3
++                token, token_len = ast.literal_eval(" ".join(parts[1:-1])), int(
++                    parts[-1]
++                )
++                token = token.encode("utf-8") if isinstance(token, str) else token
++                assert isinstance(token, bytes)
++                assert len(token) == token_len
++                token_text: str = repr(token)[2:-1]  # "b'\xff'" -> "\xff"
++                tokens.append(token_text.encode("utf-8"))
++                toktypes.append(gguf.TokenType.NORMAL)
++        remainder = vocab_size - len(tokens)
++        assert remainder >= 0
++        for i in range(len(tokens), vocab_size):
++            tokens.append(f"[PAD{i}]".encode("utf-8"))
++            toktypes.append(gguf.TokenType.UNUSED)
++
++        self.gguf_writer.add_tokenizer_model("rwkv")
++        self.gguf_writer.add_token_list(tokens)
++        self.gguf_writer.add_token_types(toktypes)
++        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=False)
++        special_vocab.chat_template = "rwkv-world"
++        # hack: Add '\n\n' as the EOT token to make it chat normally
++        special_vocab._set_special_token("eot", 261)
++        special_vocab.add_to_gguf(self.gguf_writer)
++
++    def _set_vocab_builtin(
++        self, model_name: Literal["gpt-neox", "llama-spm"], vocab_size: int
++    ):
++        tokenizer_path = Path(sys.path[0]) / "models" / f"ggml-vocab-{model_name}.gguf"
++        logger.warning(
++            f"Using tokenizer from '{os.path.relpath(tokenizer_path, os.getcwd())}'"
++        )
++        vocab_reader = gguf.GGUFReader(tokenizer_path, "r")
++
++        default_pre = "mpt" if model_name == "gpt-neox" else "default"
++
++        field = vocab_reader.get_field(gguf.Keys.Tokenizer.MODEL)
++        assert field  # tokenizer model
++        self.gguf_writer.add_tokenizer_model(bytes(field.parts[-1]).decode("utf-8"))
++
++        field = vocab_reader.get_field(gguf.Keys.Tokenizer.PRE)
++        self.gguf_writer.add_tokenizer_pre(
++            bytes(field.parts[-1]).decode("utf-8") if field else default_pre
++        )
++
++        field = vocab_reader.get_field(gguf.Keys.Tokenizer.LIST)
++        assert field  # token list
++        self.gguf_writer.add_token_list(
++            [bytes(field.parts[i]) for i in field.data][:vocab_size]
++        )
++
++        if model_name == "llama-spm":
++            field = vocab_reader.get_field(gguf.Keys.Tokenizer.SCORES)
++            assert field  # token scores
++            self.gguf_writer.add_token_scores(
++                [field.parts[i].tolist()[0] for i in field.data][:vocab_size]
++            )
++
++        field = vocab_reader.get_field(gguf.Keys.Tokenizer.TOKEN_TYPE)
++        assert field  # token types
++        self.gguf_writer.add_token_types(
++            [field.parts[i].tolist()[0] for i in field.data][:vocab_size]
++        )
++
++        if model_name != "llama-spm":
++            field = vocab_reader.get_field(gguf.Keys.Tokenizer.MERGES)
++            assert field  # token merges
++            self.gguf_writer.add_token_merges(
++                [bytes(field.parts[i]) for i in field.data]
++            )
++
++        if (field := vocab_reader.get_field(gguf.Keys.Tokenizer.BOS_ID)) is not None:
++            self.gguf_writer.add_bos_token_id(field.parts[-1].tolist()[0])
++        if (field := vocab_reader.get_field(gguf.Keys.Tokenizer.EOS_ID)) is not None:
++            self.gguf_writer.add_eos_token_id(field.parts[-1].tolist()[0])
++        if (field := vocab_reader.get_field(gguf.Keys.Tokenizer.UNK_ID)) is not None:
++            self.gguf_writer.add_unk_token_id(field.parts[-1].tolist()[0])
++        if (field := vocab_reader.get_field(gguf.Keys.Tokenizer.PAD_ID)) is not None:
++            self.gguf_writer.add_pad_token_id(field.parts[-1].tolist()[0])
++        if (field := vocab_reader.get_field(gguf.Keys.Tokenizer.ADD_BOS)) is not None:
++            self.gguf_writer.add_add_bos_token(field.parts[-1].tolist()[0])
++        if (field := vocab_reader.get_field(gguf.Keys.Tokenizer.ADD_EOS)) is not None:
++            self.gguf_writer.add_add_eos_token(field.parts[-1].tolist()[0])
++
++
++@Model.register("Qwen2ForCausalLM", "Qwen3ForCausalLM")
++class Qwen2Model(Model):
++    model_arch = gguf.MODEL_ARCH.QWEN2
++
++    def conver_embedding(self, embedding_path: Path):
++        # 加载嵌入权重
++        embedding_weight = torch.load(
++            embedding_path, map_location="cpu", weights_only=True
++        )
++        if isinstance(embedding_weight, dict) and "weight" in embedding_weight:
++            embedding_weight = embedding_weight["weight"]
++        assert isinstance(embedding_weight, torch.Tensor)
++        if isinstance(embedding_weight, torch.jit.ScriptModule):
++            print("====embedding_weight is torch.jit.ScriptModule no need to convert")
++            return embedding_path
++
++        embedding_weight = embedding_weight.to(torch.float16)  # 转换为float16
++        # 创建空模块并手动注册参数
++        m = nn.Module()
++        par = nn.Parameter(embedding_weight)  # 注册为可训练参数
++        m.register_parameter("0", par)  # 参数名称为"0"
++        scripted_model = torch.jit.script(m)
++        out_path = self.dir_model / "cpp_quant_embedding.pt"
++        scripted_model.save(out_path)
++        if isinstance(scripted_model, torch.jit.ScriptModule):
++            print("****scripted_model is torch.jit.ScriptModule")
++        return out_path
++
++    def set_vocab(self):
++        try:
++            self._set_vocab_sentencepiece()
++        except FileNotFoundError:
++            self._set_vocab_gpt2()
++
++    def set_gguf_parameters(self):
++        super().set_gguf_parameters()
++        if (
++            self.hparams.get("rope_scaling") is not None
++            and "factor" in self.hparams["rope_scaling"]
++        ):
++            if self.hparams["rope_scaling"].get("type") == "yarn":
++                self.gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.YARN)
++                self.gguf_writer.add_rope_scaling_factor(
++                    self.hparams["rope_scaling"]["factor"]
++                )
++                self.gguf_writer.add_rope_scaling_orig_ctx_len(
++                    self.hparams["rope_scaling"]["original_max_position_embeddings"]
++                )
++        self.gguf_writer.add_bool("is_hmm", True)
++
++    def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
++        # TODO: @guoxing.xu check & test this block
++        logger.info(".....Getting tensors")
++        for name in ["quant_embedding.pt", "prefill.hmm", "decoder.hmm"]:
++            file_path = self.dir_model / name
++            logger.info(f".....Loading tensor from {file_path}")
++            if name == "quant_embedding.pt":
++                file_path = self.conver_embedding(file_path)
++            with open(file_path, "rb") as file:
++                binary_data = np.frombuffer(file.read(), dtype=np.uint8)
++                logger.info(f".....Tensor size: {binary_data.shape}")
++                data = torch.from_numpy(binary_data.copy())
++                if name == "quant_embedding.pt":
++                    os.remove(file_path)
++                yield name, data
++
++    def prepare_tensors(self):
++        # TODO: @guoxing.xu check & test this block
++        # 自定义的tensor，不需要该函数
++        # super().prepare_tensors()
++        logger.info(".....Preparing tensors")
++        for name, data_torch in chain(
++            self.generate_extra_tensors(), self.get_tensors()
++        ):
++            logger.info(
++                f".....Adding tensor {name}, {data_torch.shape}, {data_torch.nbytes}"
++            )
++            self.gguf_writer.add_tensor(
++                name, data_torch.numpy(), raw_dtype=gguf.GGMLQuantizationType.I8
++            )
++
++
++@Model.register("DeepseekForCausalLM")
++class DeepseekModel(Model):
++    model_arch = gguf.MODEL_ARCH.DEEPSEEK
++
++    def set_vocab(self):
++        try:
++            self._set_vocab_sentencepiece()
++        except FileNotFoundError:
++            self._set_vocab_gpt2()
++
++    def set_gguf_parameters(self):
++        super().set_gguf_parameters()
++        hparams = self.hparams
++        if "head_dim" in hparams:
++            rope_dim = hparams["head_dim"]
++        else:
++            rope_dim = hparams["hidden_size"] // hparams["num_attention_heads"]
++
++        self.gguf_writer.add_rope_dimension_count(rope_dim)
++        self.gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.NONE)
++        self.gguf_writer.add_leading_dense_block_count(hparams["first_k_dense_replace"])
++        self.gguf_writer.add_vocab_size(hparams["vocab_size"])
++        self.gguf_writer.add_expert_feed_forward_length(
++            hparams["moe_intermediate_size"]
++        )
++        self.gguf_writer.add_expert_weights_scale(1.0)
++        self.gguf_writer.add_expert_count(hparams["n_routed_experts"])
++        self.gguf_writer.add_expert_shared_count(hparams["n_shared_experts"])
++
++    _experts: list[dict[str, Tensor]] | None = None
++
++    @staticmethod
++    def permute(weights: Tensor, n_head: int, n_head_kv: int | None):
++        if n_head_kv is not None and n_head != n_head_kv:
++            n_head = n_head_kv
++        return (
++            weights.reshape(
++                n_head, 2, weights.shape[0] // n_head // 2, *weights.shape[1:]
++            )
++            .swapaxes(1, 2)
++            .reshape(weights.shape)
++        )
++
++    def modify_tensors(
++        self, data_torch: Tensor, name: str, bid: int | None
++    ) -> Iterable[tuple[str, Tensor]]:
++        n_head = self.hparams["num_attention_heads"]
++        n_kv_head = self.hparams.get("num_key_value_heads")
++
++        if name.endswith(("q_proj.weight", "q_proj.bias")):
++            data_torch = DeepseekModel.permute(data_torch, n_head, n_head)
++        if name.endswith(("k_proj.weight", "k_proj.bias")):
++            data_torch = DeepseekModel.permute(data_torch, n_head, n_kv_head)
++
++        # process the experts separately
++        if name.find("mlp.experts") != -1:
++            n_experts = self.hparams["n_routed_experts"]
++            assert bid is not None
++
++            if self._experts is None:
++                self._experts = [{} for _ in range(self.block_count)]
++
++            self._experts[bid][name] = data_torch
++
++            if len(self._experts[bid]) >= n_experts * 3:
++                tensors: list[tuple[str, Tensor]] = []
++
++                # merge the experts into a single 3d tensor
++                for w_name in ["down_proj", "gate_proj", "up_proj"]:
++                    datas: list[Tensor] = []
++
++                    for xid in range(n_experts):
++                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
++                        datas.append(self._experts[bid][ename])
++                        del self._experts[bid][ename]
++
++                    data_torch = torch.stack(datas, dim=0)
++
++                    merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
++
++                    new_name = self.map_tensor_name(merged_name)
++
++                    tensors.append((new_name, data_torch))
++                return tensors
++            else:
++                return []
++
++        return [(self.map_tensor_name(name), data_torch)]
++
++    def prepare_tensors(self):
++        super().prepare_tensors()
++
++        if self._experts is not None:
++            # flatten `list[dict[str, Tensor]]` into `list[str]`
++            experts = [k for d in self._experts for k in d.keys()]
++            if len(experts) > 0:
++                raise ValueError(f"Unprocessed experts: {experts}")
++
++
++###### CONVERSION LOGIC ######
++
++
++# tree of lazy tensors
++class LazyTorchTensor(gguf.LazyBase):
++    _tensor_type = torch.Tensor
++    # to keep the type-checker happy
++    dtype: torch.dtype
++    shape: torch.Size
++
++    # only used when converting a torch.Tensor to a np.ndarray
++    _dtype_map: dict[torch.dtype, type] = {
++        torch.float16: np.float16,
++        torch.float32: np.float32,
++    }
++
++    # used for safetensors slices
++    # ref: https://github.com/huggingface/safetensors/blob/079781fd0dc455ba0fe851e2b4507c33d0c0d407/bindings/python/src/lib.rs#L1046
++    # TODO: uncomment U64, U32, and U16, ref: https://github.com/pytorch/pytorch/issues/58734
++    _dtype_str_map: dict[str, torch.dtype] = {
++        "F64": torch.float64,
++        "F32": torch.float32,
++        "BF16": torch.bfloat16,
++        "F16": torch.float16,
++        # "U64": torch.uint64,
++        "I64": torch.int64,
++        # "U32": torch.uint32,
++        "I32": torch.int32,
++        # "U16": torch.uint16,
++        "I16": torch.int16,
++        "U8": torch.uint8,
++        "I8": torch.int8,
++        "BOOL": torch.bool,
++        "F8_E4M3": torch.float8_e4m3fn,
++        "F8_E5M2": torch.float8_e5m2,
++    }
++
++    def numpy(self) -> gguf.LazyNumpyTensor:
++        dtype = self._dtype_map[self.dtype]
++        return gguf.LazyNumpyTensor(
++            meta=gguf.LazyNumpyTensor.meta_with_dtype_and_shape(dtype, self.shape),
++            args=(self,),
++            func=(lambda s: s.numpy()),
++        )
++
++    @classmethod
++    def meta_with_dtype_and_shape(
++        cls, dtype: torch.dtype, shape: tuple[int, ...]
++    ) -> Tensor:
++        return torch.empty(size=shape, dtype=dtype, device="meta")
++
++    @classmethod
++    def from_safetensors_slice(cls, st_slice: Any) -> Tensor:
++        dtype = cls._dtype_str_map[st_slice.get_dtype()]
++        shape: tuple[int, ...] = tuple(st_slice.get_shape())
++        lazy = cls(
++            meta=cls.meta_with_dtype_and_shape(dtype, shape),
++            args=(st_slice,),
++            func=lambda s: s[:],
++        )
++        return cast(torch.Tensor, lazy)
++
++    @classmethod
++    def __torch_function__(cls, func, types, args=(), kwargs=None):
++        del types  # unused
++
++        if kwargs is None:
++            kwargs = {}
++
++        if func is torch.Tensor.numpy:
++            return args[0].numpy()
++
++        return cls._wrap_fn(func)(*args, **kwargs)
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description="Convert a huggingface model to a GGML compatible file"
++    )
++    parser.add_argument(
++        "--vocab-only",
++        action="store_true",
++        help="extract only the vocab",
++    )
++    parser.add_argument(
++        "--outfile",
++        type=Path,
++        help="path to write to; default: based on input. {ftype} will be replaced by the outtype.",
++    )
++    parser.add_argument(
++        "--outtype",
++        type=str,
++        choices=["f32", "f16", "bf16", "q8_0", "tq1_0", "tq2_0", "auto"],
++        default="f16",
++        help="output format - use f32 for float32, f16 for float16, bf16 for bfloat16, q8_0 for Q8_0, tq1_0 or tq2_0 for ternary, and auto for the highest-fidelity 16-bit float type depending on the first loaded tensor type",
++    )
++    parser.add_argument(
++        "--bigendian",
++        action="store_true",
++        help="model is executed on big endian machine",
++    )
++    parser.add_argument(
++        "model",
++        type=Path,
++        help="directory containing model file",
++        nargs="?",
++    )
++    parser.add_argument(
++        "--use-temp-file",
++        action="store_true",
++        help="use the tempfile library while processing (helpful when running out of memory, process killed)",
++    )
++    parser.add_argument(
++        "--no-lazy",
++        action="store_true",
++        help="use more RAM by computing all outputs before writing (use in case lazy evaluation is broken)",
++    )
++    parser.add_argument(
++        "--model-name",
++        type=str,
++        default=None,
++        help="name of the model",
++    )
++    parser.add_argument(
++        "--verbose",
++        action="store_true",
++        help="increase output verbosity",
++    )
++    parser.add_argument(
++        "--split-max-tensors",
++        type=int,
++        default=0,
++        help="max tensors in each split",
++    )
++    parser.add_argument(
++        "--split-max-size",
++        type=str,
++        default="0",
++        help="max size per split N(M|G)",
++    )
++    parser.add_argument(
++        "--dry-run",
++        action="store_true",
++        help="only print out a split plan and exit, without writing any new files",
++    )
++    parser.add_argument(
++        "--no-tensor-first-split",
++        action="store_true",
++        help="do not add tensors to the first split (disabled by default)",
++    )
++    parser.add_argument(
++        "--metadata",
++        type=Path,
++        help="Specify the path for an authorship metadata override file",
++    )
++    parser.add_argument(
++        "--print-supported-models",
++        action="store_true",
++        help="Print the supported models",
++    )
++
++    args = parser.parse_args()
++    if not args.print_supported_models and args.model is None:
++        parser.error("the following arguments are required: model")
++    return args
++
++
++def split_str_to_n_bytes(split_str: str) -> int:
++    if split_str.endswith("K"):
++        n = int(split_str[:-1]) * 1000
++    elif split_str.endswith("M"):
++        n = int(split_str[:-1]) * 1000 * 1000
++    elif split_str.endswith("G"):
++        n = int(split_str[:-1]) * 1000 * 1000 * 1000
++    elif split_str.isnumeric():
++        n = int(split_str)
++    else:
++        raise ValueError(
++            f"Invalid split size: {split_str}, must be a number, optionally followed by K, M, or G"
++        )
++
++    if n < 0:
++        raise ValueError(f"Invalid split size: {split_str}, must be positive")
++
++    return n
++
++
++def main() -> None:
++    args = parse_args()
++
++    if args.print_supported_models:
++        logger.error("Supported models:")
++        Model.print_registered_models()
++        sys.exit(0)
++
++    if args.verbose:
++        logging.basicConfig(level=logging.DEBUG)
++    else:
++        logging.basicConfig(level=logging.INFO)
++
++    dir_model = args.model
++
++    if not dir_model.is_dir():
++        logger.error(f"Error: {args.model} is not a directory")
++        sys.exit(1)
++
++    ftype_map: dict[str, gguf.LlamaFileType] = {
++        "f32": gguf.LlamaFileType.ALL_F32,
++        "f16": gguf.LlamaFileType.MOSTLY_F16,
++        "bf16": gguf.LlamaFileType.MOSTLY_BF16,
++        "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
++        "tq1_0": gguf.LlamaFileType.MOSTLY_TQ1_0,
++        "tq2_0": gguf.LlamaFileType.MOSTLY_TQ2_0,
++        "auto": gguf.LlamaFileType.GUESSED,
++    }
++
++    is_split = args.split_max_tensors > 0 or args.split_max_size != "0"
++    if args.use_temp_file and is_split:
++        logger.error("Error: Cannot use temp file when splitting")
++        sys.exit(1)
++
++    if args.outfile is not None:
++        fname_out = args.outfile
++    else:
++        fname_out = dir_model
++
++    logger.info(f"Loading model: {dir_model.name}")
++
++    hparams = Model.load_hparams(dir_model)
++
++    with torch.inference_mode():
++        output_type = ftype_map[args.outtype]
++        model_architecture = hparams["architectures"][0]
++
++        try:
++            model_class = Model.from_model_architecture(model_architecture)
++        except NotImplementedError:
++            logger.error(f"Model {model_architecture} is not supported")
++            sys.exit(1)
++
++        model_instance = model_class(
++            dir_model,
++            output_type,
++            fname_out,
++            is_big_endian=args.bigendian,
++            use_temp_file=args.use_temp_file,
++            eager=args.no_lazy,
++            metadata_override=args.metadata,
++            model_name=args.model_name,
++            split_max_tensors=args.split_max_tensors,
++            split_max_size=split_str_to_n_bytes(args.split_max_size),
++            dry_run=args.dry_run,
++            small_first_shard=args.no_tensor_first_split,
++        )
++
++        if args.vocab_only:
++            logger.info("Exporting model vocab...")
++            model_instance.write_vocab()
++            logger.info(
++                f"Model vocab successfully exported to {model_instance.fname_out}"
++            )
++        else:
++            logger.info("Exporting model...")
++            model_instance.write()
++            out_path = (
++                f"{model_instance.fname_out.parent}{os.sep}"
++                if is_split
++                else model_instance.fname_out
++            )
++            logger.info(f"Model successfully exported to {out_path}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/debian/changelog b/debian/changelog
+index f6f2ce0..8df58e8 100644
+--- a/debian/changelog
++++ b/debian/changelog
+@@ -1,7 +1,7 @@
+-kytensor-llm (2.0.0-ok15k0.5) v11-2603-preview; urgency=medium
++kytensor-llm (2.0.0-ok15k0.6) v11-2603-preview; urgency=medium
+ 
+-  * BUG: #507905 解决格兰菲卸载模型失败问题
+-  * 需求: 无
++  * BUG: 无
++  * 需求: #525831 支持后摩卡大模型推理
+   * 其他改动说明: 无
+   * 其他改动影响域: 无
+ 
+diff --git a/examples/server/server.cpp b/examples/server/server.cpp
+index c27ca96..39a4cee 100644
+--- a/examples/server/server.cpp
++++ b/examples/server/server.cpp
+@@ -1913,7 +1913,12 @@ struct server_context {
+     }
+ 
+     void init() {
+-        const int32_t n_ctx_slot = n_ctx / params_base.n_parallel;
++        int32_t n_ctx_slot = n_ctx / params_base.n_parallel;
++        char buf[128] = {0};
++        if(llama_model_meta_val_str(model, "is_hmm", buf, sizeof(buf)/sizeof(buf[0])) > 0) {
++            SRV_INF("model is HMM: %s\n", buf);
++            n_ctx_slot = n_ctx; // for HMM models we use the full context
++        }
+ 
+         SRV_INF("initializing slots, n_slots = %d\n", params_base.n_parallel);
+ 
+diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
+index 095637f..0365d34 100644
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -323,7 +323,7 @@ foreach (target ggml-base ggml)
+     target_compile_features   (${target} PRIVATE c_std_11 cxx_std_17) # don't bump
+ endforeach()
+ 
+-target_link_libraries(ggml-base PRIVATE Threads::Threads tongyi_decrypt pciaccess)
++target_link_libraries(ggml-base PRIVATE Threads::Threads tongyi_decrypt)
+ 
+ find_library(MATH_LIBRARY m)
+ if (MATH_LIBRARY)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index b340dae..b53eb86 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -30,9 +30,12 @@ add_library(llama
+             unicode-data.cpp
+             unicode.cpp
+             unicode.h
++            houmo-llmodel.cpp
++            houmo-embedding-layer.cpp
+             )
+ 
+ target_include_directories(llama PUBLIC . ../include ../common)
++
+ target_compile_features   (llama PUBLIC cxx_std_17) # don't bump
+ 
+ target_link_libraries(llama PUBLIC ggml)
+@@ -41,4 +44,4 @@ if (BUILD_SHARED_LIBS)
+     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
+     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
+     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
+-endif()
++endif()
+\ No newline at end of file
+diff --git a/src/houmo-embedding-layer.cpp b/src/houmo-embedding-layer.cpp
+new file mode 100644
+index 0000000..6858ac2
+--- /dev/null
++++ b/src/houmo-embedding-layer.cpp
+@@ -0,0 +1,162 @@
++#include "houmo-embedding-layer.h"
++#include <fstream>
++#include <cstring>
++#include "llama-impl.h"
++
++HoumoEmbeddingLayer::HoumoEmbeddingLayer(const std::string &weight_path, int64_t offset,
++                               int64_t size) {
++    load_weight(weight_path, offset, size);
++    // 预计算嵌入维度（n_embd）
++    if (shape_.size() != 2) {
++        throw std::runtime_error(
++            "Embedding weight must be 2D tensor (vocab_size, n_embd)");
++    }
++    vocab_size_ = shape_[0];
++    n_embd_ = shape_[1];
++    LLAMA_LOG_INFO("EmbeddingLayer init success: vocab_size=%d, n_embd=%d, dtype=%d",
++                   vocab_size_, n_embd_, static_cast<int>(dtype_));
++}
++HoumoEmbeddingLayer::HoumoEmbeddingLayer(const void *data, int64_t size) {
++    load_weight_from_mem(data, size);
++    vocab_size_ = shape_[0];
++    n_embd_ = shape_[1];
++    LLAMA_LOG_INFO("EmbeddingLayer init success: vocab_size=%d, n_embd=%d, dtype=%d",
++                   vocab_size_, n_embd_, static_cast<int>(dtype_));
++}
++
++void HoumoEmbeddingLayer::get_embedding(int32_t token_id, void *out) {
++    validate_token_id(token_id);
++
++    size_t offset = token_id * n_embd_ * sizeof(int16_t);
++    std::vector<int16_t> embedding(n_embd_);
++    // 直接拷贝int16原始数据
++    memcpy(out, &data_[offset], n_embd_ * sizeof(int16_t));
++}
++
++// ========== 新增：批量获取int16格式embedding（高性能） ==========
++void HoumoEmbeddingLayer::get_embedding_batch(
++    const std::vector<int32_t> &token_ids, void *out_batch) {
++    char *out_batch_char = static_cast<char *>(out_batch);
++    for (size_t i = 0; i < token_ids.size(); ++i) {
++        uint32_t token_id = token_ids[i];
++        validate_token_id(token_id);
++        size_t offset = token_id * n_embd_ * sizeof(int16_t);
++        memcpy(out_batch_char + i * n_embd_ * sizeof(int16_t),
++                    &data_[offset], n_embd_ * sizeof(int16_t));
++    }
++}
++
++// 核心函数：加载二进制权重文件
++void HoumoEmbeddingLayer::load_weight(const std::string &weight_path, int64_t offset,
++                               int64_t size) {
++    (void) size;
++    std::ifstream f(weight_path, std::ios::binary);
++    if (!f.is_open()) {
++        throw std::runtime_error("Failed to open weight file: " + weight_path);
++    }
++    // 跳过偏移量
++    f.seekg(offset, std::ios::beg);
++    uint32_t tmp;
++
++    // 1. 读取维度数
++    f.read(reinterpret_cast<char *>(&tmp), sizeof(uint32_t));
++    if (f.gcount() != sizeof(uint32_t)) {
++        throw std::runtime_error("Failed to read dim count from weight file");
++    }
++    uint32_t dim_count = tmp;
++
++    // 2. 读取各维度值
++    shape_.resize(dim_count);
++    for (uint32_t i = 0; i < dim_count; ++i) {
++        f.read(reinterpret_cast<char *>(&tmp), sizeof(uint32_t));
++        if (f.gcount() != sizeof(uint32_t)) {
++            throw std::runtime_error("Failed to read dim " + std::to_string(i) +
++                                     " from weight file");
++        }
++        shape_[i] = tmp;
++    }
++
++    // 3. 读取数据类型标识
++    f.read(reinterpret_cast<char *>(&tmp), sizeof(uint32_t));
++    if (f.gcount() != sizeof(uint32_t)) {
++        throw std::runtime_error("Failed to read dtype from weight file");
++    }
++    dtype_ = static_cast<EmbeddingDtype>(tmp);
++    if (dtype_ != EmbeddingDtype::INT16 && dtype_ != EmbeddingDtype::FLOAT16) {
++        throw std::runtime_error("Unsupported dtype: " + std::to_string(tmp) +
++                                 " (only INT16/FLOAT16 are supported)");
++    }
++
++    // 4. 计算总元素数
++    size_t elem_count = 1;
++    for (uint32_t d : shape_) {
++        elem_count *= d;
++    }
++
++    data_.resize(elem_count * sizeof(int16_t));
++    f.read(reinterpret_cast<char *>(data_.data()),
++            elem_count * sizeof(int16_t));
++    if (f.gcount() !=
++        static_cast<std::streamsize>(elem_count * sizeof(int16_t))) {
++        throw std::runtime_error(
++            "Failed to read int16 data from weight file");
++    }
++    f.close();
++}
++void HoumoEmbeddingLayer::load_weight_from_mem(const void* weight_ptr, int64_t size) {
++    if (weight_ptr == nullptr) {
++        throw std::runtime_error("Weight memory pointer is null");
++    }
++
++    const uint8_t* curr = static_cast<const uint8_t*>(weight_ptr);
++    int64_t bytes_read = 0;
++
++    auto safe_read = [&](void* dest, size_t n) {
++        if (size > 0 && bytes_read + static_cast<int64_t>(n) > size) {
++            throw std::runtime_error("Failed to read from memory: Buffer overflow during weight parsing");
++        }
++        std::memcpy(dest, curr, n);
++        curr += n;
++        bytes_read += n;
++    };
++
++    uint32_t tmp;
++
++    // 1. 读取维度数 (例如 2 维: [vocab_size, hidden_dim])
++    safe_read(&tmp, sizeof(uint32_t));
++    uint32_t dim_count = tmp;
++    if (dim_count == 0 || dim_count > 10) { // 增加启发式检查
++        throw std::runtime_error("Invalid dim_count: " + std::to_string(dim_count));
++    }
++
++    // 2. 读取各维度值
++    shape_.clear(); // 确保清空旧数据
++    shape_.resize(dim_count);
++    for (uint32_t i = 0; i < dim_count; ++i) {
++        safe_read(&tmp, sizeof(uint32_t));
++        shape_[i] = tmp;
++    }
++
++    // 3. 读取数据类型
++    safe_read(&tmp, sizeof(uint32_t));
++    dtype_ = static_cast<EmbeddingDtype>(tmp);
++
++    if (dtype_ != EmbeddingDtype::INT16 && dtype_ != EmbeddingDtype::FLOAT16) {
++        throw std::runtime_error("Unsupported dtype: " + std::to_string(tmp) +
++                                 " (only INT16/FLOAT16 are supported)");
++    }
++
++    // 4. 计算总元素数并加载数据
++    size_t elem_count = 1;
++    for (uint32_t d : shape_) {
++        elem_count *= d;
++    }
++
++    if (elem_count == 0) {
++        throw std::runtime_error("Calculated elem_count is 0, check shape dimensions");
++    }
++
++    size_t data_bytes = elem_count * sizeof(int16_t);
++    data_.resize(data_bytes);
++    safe_read(data_.data(), data_bytes);
++}
+diff --git a/src/houmo-embedding-layer.h b/src/houmo-embedding-layer.h
+new file mode 100644
+index 0000000..fe50172
+--- /dev/null
++++ b/src/houmo-embedding-layer.h
+@@ -0,0 +1,64 @@
++#pragma once
++#include <cstdint>
++#include <string>
++#include <stdexcept>
++#include <vector>
++
++// 数据类型枚举（与Python导出的二进制格式对齐）
++enum class EmbeddingDtype {
++    INT16 = 0,   // 对应Python端的torch.int16
++    FLOAT16 = 1, // 对应Python端的torch.float16
++    UNKNOWN = 255
++};
++
++// 嵌入层核心类（支持直接返回int16/float16原始格式）
++class HoumoEmbeddingLayer {
++  public:
++    HoumoEmbeddingLayer(const std::string &weight_path, int64_t offset, int64_t size);
++    HoumoEmbeddingLayer(const void *data, int64_t size);
++
++    void get_embedding(int32_t token_id, void *data);
++
++    void get_embedding_batch(const std::vector<int32_t> &token_ids,
++                                   void *data);
++    // ========== 工具接口 ==========
++    // 获取词汇表大小
++    uint32_t get_vocab_size() const { return vocab_size_; }
++
++    // 获取嵌入维度
++    uint32_t get_n_embd() const { return n_embd_; }
++
++    // 获取原始数据类型
++    EmbeddingDtype get_dtype() const { return dtype_; }
++
++    // 检查是否为int16类型
++    bool is_int16() const { return dtype_ == EmbeddingDtype::INT16; }
++
++    // 检查是否为float16类型
++    bool is_float16() const { return dtype_ == EmbeddingDtype::FLOAT16; }
++
++  private:
++    // 私有成员变量
++    std::vector<uint32_t> shape_; // 权重形状 [vocab_size, n_embd]
++    EmbeddingDtype dtype_ = EmbeddingDtype::UNKNOWN; // 原始数据类型
++    std::vector<int8_t> data_;                        // int8格式权重
++    uint32_t vocab_size_ = 0;                        // 词汇表大小
++    uint32_t n_embd_ = 0;                            // 嵌入维度
++
++    // ========== 私有工具函数 ==========
++    // 验证token_id是否合法
++    void validate_token_id(uint32_t token_id) const {
++        if (token_id >= vocab_size_) {
++            throw std::out_of_range("Token_id " + std::to_string(token_id) +
++                                    " exceeds vocab_size " +
++                                    std::to_string(vocab_size_));
++        }
++    }
++
++    // 核心函数：加载二进制权重文件
++    void load_weight(const std::string &weight_path, int64_t offset, int64_t size);
++    // weight_ptr: 内存起始地址
++    // offset: 相对该地址的偏移
++    // size: 数据最大长度限制
++    void load_weight_from_mem(const void* weight_ptr, int64_t size);
++};
+\ No newline at end of file
+diff --git a/src/houmo-llmodel.cpp b/src/houmo-llmodel.cpp
+new file mode 100644
+index 0000000..6fc0ef7
+--- /dev/null
++++ b/src/houmo-llmodel.cpp
+@@ -0,0 +1,1102 @@
++#include "houmo-llmodel.h"
++#include "ggml.h"
++#include "gguf.h"
++#include "llama-impl.h"
++#include <cassert>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <map>
++#ifdef ENABLE_HOUMO_DADAO
++#include "tcim_c_api_loader.h"
++#include "houmo-embedding-layer.h"
++#include "json.hpp"
++using json = nlohmann::ordered_json;
++
++// Global API table for TCIM C API
++static tcim_api_table_t g_tcim_api;
++static bool g_tcim_loaded = false;
++
++// Helper function to load TCIM library
++static bool load_tcim_library() {
++    if (g_tcim_loaded) return true;
++
++    const char* lib_path = std::getenv("TCIM_LIBRARY_PATH");
++    if (!lib_path) {
++#ifdef _WIN32
++        lib_path = "tcim_c_api_bridge.dll";
++#else
++        lib_path = "/usr/local/houmo/lib/libtcim_runtime_c_api.so";
++#endif
++    }
++
++    if (!tcim_load_library(lib_path, &g_tcim_api)) {
++        LLAMA_LOG_ERROR("Failed to load TCIM library: %s\n", tcim_get_last_error());
++        return false;
++    }
++
++    g_tcim_loaded = true;
++    return true;
++}
++
++struct kv_cache_item {
++    std::vector<tcim_tensor_t> tensors;
++    std::vector<std::string> names;
++    int seq_id = 0;
++};
++
++struct lora_item {
++    void * adapter; //记录上层lora contex指针
++    float scale;  // scale 0.0 表示disable， 1.0 表示enable
++};
++
++class HouMoLLModel::Impl {
++  public:
++    Impl() = default;
++    ~Impl() { cleanup_tensors(); }
++
++    bool houmo_load(llama_model_loader &loader);
++    bool houmo_load_fromfile(llama_model_loader &loader);
++
++    void houmo_init(int seq_max);
++    int houmo_prefill(std::vector<llama_token> &tokens, int seq_id,
++                      float *logits);
++
++    int houmo_decode(std::vector<llama_token> &batches,
++                     std::vector<int> &seq_ids, std::vector<float *> logits);
++
++    int n_decode_batch() { return n_decode_batch_; }
++    int n_prefill_batch() { return n_prefill_batch_; }
++    uint32_t n_context_length() { return context_length_; }
++    void lora_init(std::string file_path, void *adapter);
++    void lora_set_scale(void *adapter, float scale);
++    void lora_clear();
++    void seq_rm(int seq_id, int p0, int p1);
++  private:
++    void parser_gguf_parameters(struct gguf_context *ctx);
++    void cleanup_tensors();
++  private:
++    int prefill_length_ = 256;
++    int context_length_ = 4096;
++    int n_blocks_ = 28;
++    int64_t n_embd_ = 3584;
++    tcim_module_t prefill_model_ = nullptr;
++    tcim_module_t decode_model_ = nullptr;
++    int device_num_ = 1;
++    int n_prefill_batch_ = 1;
++    int n_decode_batch_ = 1;
++    std::map<std::string, tcim_tensor_t> prefill_input_map_;
++    std::map<std::string, tcim_tensor_t> prefill_output_map_;
++    std::map<std::string, tcim_tensor_t> decode_input_map_;
++    std::map<std::string, tcim_tensor_t> decode_output_map_;
++    std::vector<std::string> input_names_;
++    std::vector<std::string> decode_output_names_;
++    std::vector<std::string> prefill_output_names_;
++    std::map<int, kv_cache_item> kv_cache_;
++    int need_set_kv_cache_ = 0; // 0: no need, 1: need
++    std::string kGeneralArch = "general.architecture";
++    std::string kEmbeddingLengthEx = ".embedding_length";
++    std::string kBlockCountEx = ".block_count";
++    std::string kHmmInfo = "hmm.info";
++    std::shared_ptr<HoumoEmbeddingLayer> embedding_layer_;
++    std::map<std::string, lora_item> lora_map;
++    tcim_tensor_t lora_mask_float_ = nullptr;
++    std::map<int, int> kv_offset_;
++    tcim_tensor_t prefill_output_raw_ = nullptr;
++    tcim_tensor_t decode_output_raw_ = nullptr;
++};
++
++// 封装数据类型无关的操作
++template <typename T>
++void SetInputData(tcim_tensor_t tensor, int batch_size, int value) {
++    std::vector<T> data_vec(batch_size, value);
++    g_tcim_api.tcim_tensor_copy_from_host(tensor, data_vec.data(), g_tcim_api.tcim_tensor_get_mem_size(tensor), 0);
++}
++
++template <typename T>
++void SetInputData(tcim_tensor_t tensor, std::vector<int32_t> &int32_vec) {
++    std::vector<T> data_vec;
++    for (auto val: int32_vec) {
++        data_vec.push_back(static_cast<T>(val));
++    }
++    g_tcim_api.tcim_tensor_copy_from_host(tensor, data_vec.data(), g_tcim_api.tcim_tensor_get_mem_size(tensor), 0);
++}
++
++void HouMoLLModel::Impl::cleanup_tensors() {
++    for (auto& pair : prefill_input_map_) {
++        if (pair.second) g_tcim_api.tcim_tensor_destroy(pair.second);
++    }
++    prefill_input_map_.clear();
++
++    for (auto& pair : prefill_output_map_) {
++        if (pair.second) g_tcim_api.tcim_tensor_destroy(pair.second);
++    }
++    prefill_output_map_.clear();
++
++    for (auto& pair : decode_input_map_) {
++        if (pair.second) g_tcim_api.tcim_tensor_destroy(pair.second);
++    }
++    decode_input_map_.clear();
++
++    for (auto& pair : decode_output_map_) {
++        if (pair.second) g_tcim_api.tcim_tensor_destroy(pair.second);
++    }
++    decode_output_map_.clear();
++
++    if (lora_mask_float_) {
++        g_tcim_api.tcim_tensor_destroy(lora_mask_float_);
++        lora_mask_float_ = nullptr;
++    }
++
++    if (prefill_output_raw_) {
++        g_tcim_api.tcim_tensor_destroy(prefill_output_raw_);
++        prefill_output_raw_ = nullptr;
++    }
++    if (decode_output_raw_) {
++        g_tcim_api.tcim_tensor_destroy(decode_output_raw_);
++        decode_output_raw_ = nullptr;
++    }
++
++    for (auto& pair : kv_cache_) {
++        for (auto& t : pair.second.tensors) {
++            if (t) g_tcim_api.tcim_tensor_destroy(t);
++        }
++    }
++    kv_cache_.clear();
++
++    if (prefill_model_) {
++        g_tcim_api.tcim_module_destroy(prefill_model_);
++        prefill_model_ = nullptr;
++    }
++    if (decode_model_) {
++        g_tcim_api.tcim_module_destroy(decode_model_);
++        decode_model_ = nullptr;
++    }
++}
++
++void static read_tensor_to_buffer(const std::string &file_name, size_t offset,
++                                  size_t size, std::vector<char> &buffer) {
++    // 打开输入文件
++    std::ifstream input_file(file_name, std::ios::binary);
++    if (!input_file.is_open()) {
++        LLAMA_LOG_ERROR("%s: failed to open file: %s\n", __func__,
++                        file_name.c_str());
++        return;
++    }
++
++    // 移动到偏移位置
++    input_file.seekg(offset, std::ios::beg);
++    if (input_file.fail()) {
++        LLAMA_LOG_ERROR("%s: failed to seek to offset: %zu in file: %s\n",
++                        __func__, offset, file_name.c_str());
++        input_file.close();
++        return;
++    }
++
++    // 读取数据
++    input_file.read(buffer.data(), size);
++    if (input_file.fail()) {
++        LLAMA_LOG_ERROR("%s: failed to read %zu bytes from file: %s\n",
++                        __func__, size, file_name.c_str());
++        input_file.close();
++        return;
++    }
++}
++
++static std::vector<int> parse_deviceids() {
++    std::vector<int> deviceIds;
++    const char *device_id_str = std::getenv("HOUMO_DEVICE_ID");
++
++    if (device_id_str == nullptr) {
++        deviceIds.push_back(0);
++        return deviceIds;
++    }
++
++    std::string deviceList(device_id_str);
++    std::istringstream iss(deviceList);
++    std::string token;
++
++    while (std::getline(iss, token, ',')) {
++        try {
++            // 转换为整数并添加到列表
++            deviceIds.push_back(std::stoi(token));
++        } catch (const std::invalid_argument &) {
++            LLAMA_LOG_ERROR("Invalid device ID: %s", token.c_str());
++            deviceIds = {0};
++            return deviceIds;
++        } catch (const std::out_of_range &) {
++            LLAMA_LOG_ERROR("Device ID out of range: %s", token.c_str());
++            deviceIds = {0};
++            return deviceIds;
++        }
++    }
++
++    return deviceIds;
++}
++
++void HouMoLLModel::Impl::parser_gguf_parameters(struct gguf_context *ctx) {
++    auto key_id = gguf_find_key(ctx, kGeneralArch.c_str());
++    if (key_id < 0) {
++        LLAMA_LOG_INFO("%s: failed to find key %s in gguf file\n", __func__,
++                        kGeneralArch.c_str());
++        return;
++    }
++    std::string model_arch = gguf_get_val_str(ctx, key_id);
++    std::string key = model_arch + kBlockCountEx;
++    key_id = gguf_find_key(ctx, key.c_str());
++    if (key_id < 0) {
++        LLAMA_LOG_INFO("%s: not found key %s in gguf file\n", __func__,
++                        key.c_str());
++    } else {
++        n_blocks_ = gguf_get_val_u32(ctx, key_id);
++    }
++    key = model_arch + kEmbeddingLengthEx;
++    key_id = gguf_find_key(ctx, key.c_str());
++    if (key_id < 0) {
++        LLAMA_LOG_INFO("%s: not found key %s in gguf file\n", __func__,
++                        key.c_str());
++    } else {
++        n_embd_ = gguf_get_val_u32(ctx, key_id);
++    }
++    // 解析hmm.info
++    key_id = gguf_find_key(ctx, kHmmInfo.c_str());
++    if (key_id < 0) {
++        LLAMA_LOG_INFO("%s: not found key %s in gguf file\n", __func__,
++                        kHmmInfo.c_str());
++        return;
++    }
++    auto hmm_info_str = gguf_get_val_str(ctx, key_id);
++    LLAMA_LOG_INFO("%s: hmm_info: %s\n", __func__, hmm_info_str);
++    try {
++        // 解析hmm.info
++        auto hmm_info = json::parse(hmm_info_str);
++        if (hmm_info.contains("device_num")) {
++            device_num_ = hmm_info["device_num"];
++        }
++
++    } catch (const json::parse_error &e) {
++        LLAMA_LOG_ERROR("%s: failed to parse hmm_info: %s\n", __func__,
++                        e.what());
++        return;
++    }
++}
++
++bool HouMoLLModel::Impl::houmo_load_fromfile(llama_model_loader &loader) {
++    if (!load_tcim_library()) {
++        return false;
++    }
++
++    std::string file_name = loader.fname_;
++    gguf_context* ctx = loader.meta.get();
++    LLAMA_LOG_INFO("HouMoLLModel::houmo_load after gguf_init_from_file\n");
++    // 从gguf文件中加载hmmodel的device_ids信息
++    auto device_ids = parse_deviceids();
++    if (device_num_ == 2 && device_ids.size() == 1) {
++        // 单卡模型，但是模型是双卡模型，需要将device_ids 扩展为{0,1}
++        device_ids = {0, 1};
++        LLAMA_LOG_WARN("dual card model, need to set device_ids to {0,1}");
++    } else if (device_num_ == 1 && device_ids.size() > 1) {
++        // 模型是单卡模型，需要将device_ids 缩小为{0}
++        device_ids = {0};
++        LLAMA_LOG_WARN(
++            "single card model, set device_ids size > 1, need to "
++            "resize device_ids to {0}");
++    } else if ( device_num_ == 4 && device_ids.size() == 1) {
++        // 模型是四卡模型，需要将device_ids 扩展为{0,1,2,3}
++        device_ids = {0, 1, 2, 3};
++        LLAMA_LOG_WARN(
++            "4 card model, need to set device_ids to {0,1,2,3}");
++    } else {
++        LLAMA_LOG_INFO("run models in %zu cards", device_ids.size());
++    }
++    // load model
++    tcim_dev_manager_t dev_manager = g_tcim_api.tcim_dev_manager_create(device_ids.data(), device_ids.size(), "Xh2HalBackend");
++    if (!dev_manager) {
++        LLAMA_LOG_ERROR("Failed to create dev_manager\n");
++        return false;
++    }
++    tcim_weight_manager_t wm = g_tcim_api.tcim_weight_manager_create(dev_manager);
++    g_tcim_api.tcim_dev_manager_destroy(dev_manager);
++    if (!wm) {
++        LLAMA_LOG_ERROR("Failed to create weight_manager\n");
++        return false;
++    }
++
++    std::vector<std::string> dummy_tensor_names;
++    // 防止更高效使用内存，这个将prefill 设置为dummy_tensor_names
++    for (int idx = 0; idx < n_blocks_; idx++) {
++        std::string k_cache_name = "model_layers_" +
++                                   std::to_string(idx) +
++                                   "_self_attn_kcache_input";
++        std::string v_cache_name = "model_layers_" +
++                                   std::to_string(idx) +
++                                   "_self_attn_vcache_input";
++        dummy_tensor_names.push_back(k_cache_name);
++        dummy_tensor_names.push_back(v_cache_name);
++    }
++    // 是否开启lazy mode，默认开启
++    bool enable_lazy_mode = !loader.use_mmap;
++    if (const char *env = std::getenv("LLAMA_ENABLE_LAZY_MODE")) {
++        enable_lazy_mode = (std::string(env) == "1");
++    }
++    // 1. 加载 embedding
++    const int n_tensors = gguf_get_n_tensors(ctx);
++    for (int i = 0; i < n_tensors; ++i) {
++        const char *name = gguf_get_tensor_name(ctx, i);
++        LLAMA_LOG_INFO("tensor[%d]: name = %s\n", i, name);
++        const size_t size = gguf_get_tensor_size(ctx, i);
++        size_t offset = gguf_get_tensor_offset(ctx, i) + gguf_get_meta_size(ctx);
++        if (strncmp(name, "quant_embedding.bin", strlen("quant_embedding.bin")) ==
++            0) {
++            std::vector<char> buffer(size);
++            read_tensor_to_buffer(file_name, offset, size, buffer);
++            embedding_layer_ =
++                std::make_shared<HoumoEmbeddingLayer>(file_name, offset, size);
++        } else if (strncmp(name, "prefill.hmm", strlen("prefill.hmm")) == 0) {
++            // load prefill
++            tcim_module_option_t option_prefill = g_tcim_api.tcim_module_option_create(wm);
++            if (dummy_tensor_names.size() > 0) {
++                std::vector<const char*> dummy_names;
++                for (const auto& s : dummy_tensor_names) {
++                    dummy_names.push_back(s.c_str());
++                }
++                g_tcim_api.tcim_module_option_set_dummy_tensors(option_prefill, dummy_names.data(), dummy_names.size());
++            }
++            g_tcim_api.tcim_module_option_enable_lazy_mode(option_prefill, enable_lazy_mode);
++            g_tcim_api.tcim_module_option_set_model_offset(option_prefill, offset, size);
++            prefill_model_ = g_tcim_api.tcim_module_create();
++            tcim_status_t status = g_tcim_api.tcim_module_load_model_file(prefill_model_, file_name.c_str(), option_prefill);
++            g_tcim_api.tcim_module_option_destroy(option_prefill);
++            if (status != TCIM_OK) {
++                LLAMA_LOG_ERROR("LoadModel failed: status == %d\n", (int)status);
++                g_tcim_api.tcim_weight_manager_destroy(wm);
++                return false;
++            }
++            LLAMA_LOG_INFO("%s: succeed to load prefill.hmm\n", __func__);
++        } else if (strncmp(name, "decoder.hmm", strlen("decoder.hmm")) == 0) {
++            // load decode
++            tcim_module_option_t option_decode = g_tcim_api.tcim_module_option_create(wm);
++            g_tcim_api.tcim_module_option_enable_lazy_mode(option_decode, enable_lazy_mode);
++            g_tcim_api.tcim_module_option_set_model_offset(option_decode, offset, size);
++            decode_model_ = g_tcim_api.tcim_module_create();
++            tcim_status_t status = g_tcim_api.tcim_module_load_model_file(decode_model_, file_name.c_str(), option_decode);
++            g_tcim_api.tcim_module_option_destroy(option_decode);
++            if (status != TCIM_OK) {
++                LLAMA_LOG_ERROR("LoadModel failed: status == %d\n", (int)status);
++                g_tcim_api.tcim_weight_manager_destroy(wm);
++                return false;
++            }
++            LLAMA_LOG_INFO("%s: succeed to load decode.hmm\n", __func__);
++        } else {
++            LLAMA_LOG_INFO("skip tensor[%d]: name = %s, size = %zu\n", i, name,
++                           size);
++        }
++    }
++    g_tcim_api.tcim_weight_manager_destroy(wm);
++    return true;
++}
++
++bool HouMoLLModel::Impl::houmo_load(llama_model_loader &loader) {
++    if (!load_tcim_library()) {
++        return false;
++    }
++
++    gguf_context* ctx = loader.meta.get();
++    parser_gguf_parameters(ctx);
++    // 从gguf文件中加载hmmodel的device_ids信息
++    auto device_ids = parse_deviceids();
++    if (device_num_ == 2 && device_ids.size() == 1) {
++        // 单卡模型，但是模型是双卡模型，需要将device_ids 扩展为{0,1}
++        device_ids = {0, 1};
++        LLAMA_LOG_WARN("dual card model, need to set device_ids to {0,1}");
++    } else if (device_num_ == 1 && device_ids.size() > 1) {
++        // 模型是单卡模型，需要将device_ids 缩小为{0}
++        device_ids = {0};
++        LLAMA_LOG_WARN(
++            "single card model, set device_ids size > 1, need to "
++            "resize device_ids to {0}");
++    } else if ( device_num_ == 4 && device_ids.size() == 1) {
++        // 模型是四卡模型，需要将device_ids 扩展为{0,1,2,3}
++        device_ids = {0, 1, 2, 3};
++        LLAMA_LOG_WARN(
++            "4 card model, need to set device_ids to {0,1,2,3}");
++    } else {
++        LLAMA_LOG_INFO("run models in %zu cards", device_ids.size());
++    }
++    // load model
++    tcim_dev_manager_t dev_manager = g_tcim_api.tcim_dev_manager_create(device_ids.data(), device_ids.size(), "Xh2HalBackend");
++    if (!dev_manager) {
++        LLAMA_LOG_ERROR("Failed to create dev_manager\n");
++        return false;
++    }
++    tcim_weight_manager_t wm = g_tcim_api.tcim_weight_manager_create(dev_manager);
++    g_tcim_api.tcim_dev_manager_destroy(dev_manager);
++    if (!wm) {
++        LLAMA_LOG_ERROR("Failed to create weight_manager\n");
++        return false;
++    }
++
++    std::vector<std::string> dummy_tensor_names;
++    // 防止更高效使用内存，这个将prefill 设置为dummy_tensor_names
++    for (int idx = 0; idx < n_blocks_; idx++) {
++        std::string k_cache_name = "model_layers_" +
++                                   std::to_string(idx) +
++                                   "_self_attn_kcache_input";
++        std::string v_cache_name = "model_layers_" +
++                                   std::to_string(idx) +
++                                   "_self_attn_vcache_input";
++        dummy_tensor_names.push_back(k_cache_name);
++        dummy_tensor_names.push_back(v_cache_name);
++    }
++    bool enable_lazy_mode = true;
++    // 1. 加载 embedding
++    const int n_tensors = gguf_get_n_tensors(ctx);
++    char *model_addr = (char *)gguf_get_model_addr(ctx);
++    if (model_addr == nullptr) {
++        g_tcim_api.tcim_weight_manager_destroy(wm);
++        return houmo_load_fromfile(loader);
++    }
++    LLAMA_LOG_INFO("HouMoLLModel::houmo_load from model_addr\n");
++
++    bool retval = true;
++    for (int i = 0; i < n_tensors; ++i) {
++        const char *name = gguf_get_tensor_name(ctx, i);
++        const size_t size = gguf_get_tensor_size(ctx, i);
++        size_t offset = gguf_get_tensor_offset(ctx, i) + gguf_get_meta_size(ctx);
++        char *raw_data = model_addr + offset;
++
++        LLAMA_LOG_INFO("tensor[%d]: name = %s， size = %zu\n", i, name, size);
++        if (strncmp(name, "quant_embedding.bin", strlen("quant_embedding.bin")) ==
++            0) {
++            embedding_layer_ =
++                std::make_shared<HoumoEmbeddingLayer>(raw_data, size);
++        } else if (strncmp(name, "prefill.hmm", strlen("prefill.hmm")) == 0) {
++            // load prefill
++            tcim_module_option_t option_prefill = g_tcim_api.tcim_module_option_create(wm);
++            if (dummy_tensor_names.size() > 0) {
++                std::vector<const char*> dummy_names;
++                for (const auto& s : dummy_tensor_names) {
++                    dummy_names.push_back(s.c_str());
++                }
++                g_tcim_api.tcim_module_option_set_dummy_tensors(option_prefill, dummy_names.data(), dummy_names.size());
++            }
++            g_tcim_api.tcim_module_option_enable_lazy_mode(option_prefill, enable_lazy_mode);
++            prefill_model_ = g_tcim_api.tcim_module_create();
++            tcim_status_t status = g_tcim_api.tcim_module_load_model_mem(prefill_model_, raw_data, size, option_prefill);
++            g_tcim_api.tcim_module_option_destroy(option_prefill);
++            if (status != TCIM_OK) {
++                LLAMA_LOG_ERROR("LoadModel failed: status == %d\n", (int)status);
++                retval = false;
++            }
++            LLAMA_LOG_INFO("%s: succeed to load prefill.hmm\n", __func__);
++        } else if (strncmp(name, "decoder.hmm", strlen("decoder.hmm")) == 0) {
++            // load decode
++            tcim_module_option_t option_decode = g_tcim_api.tcim_module_option_create(wm);
++            g_tcim_api.tcim_module_option_enable_lazy_mode(option_decode, enable_lazy_mode);
++            decode_model_ = g_tcim_api.tcim_module_create();
++            tcim_status_t status = g_tcim_api.tcim_module_load_model_mem(decode_model_, raw_data, size, option_decode);
++            g_tcim_api.tcim_module_option_destroy(option_decode);
++            if (status != TCIM_OK) {
++                LLAMA_LOG_ERROR("LoadModel failed: status == %d\n", (int)status);
++                retval = false;
++            }
++            LLAMA_LOG_INFO("%s: succeed to load decode.hmm\n", __func__);
++        } else {
++            LLAMA_LOG_INFO("skip tensor[%d]: name = %s, size = %zu\n", i, name,
++                           size);
++        }
++        if (!retval) {
++            break;
++        }
++    }
++    g_tcim_api.tcim_weight_manager_destroy(wm);
++    return retval;
++}
++
++void HouMoLLModel::Impl::houmo_init(int seq_max) {
++    // init prefill
++    int input_num = g_tcim_api.tcim_module_get_input_num(prefill_model_);
++    assert(input_num > 3);
++    for (int idx = 0; idx < input_num; idx++) {
++        const char* input_name_c = g_tcim_api.tcim_module_get_input_name(prefill_model_, idx);
++        if (!input_name_c) continue;
++        std::string input_name(input_name_c);
++        if (input_name.find("past_key_cache_") != std::string::npos ||
++            input_name.find("_self_attn_vcache") != std::string::npos ||
++            input_name.find("_self_attn_kcache") != std::string::npos) {
++            continue;
++        }
++        input_names_.push_back(input_name);
++        LLAMA_LOG_INFO("%s: prefill input_name: %s\n", __func__,
++                       input_name.c_str());
++        tcim_tensor_info_t input_info = g_tcim_api.tcim_module_get_input_info(prefill_model_, input_name_c);
++        if (!input_info) continue;
++        tcim_tensor_info_t input_info_contiguous = g_tcim_api.tcim_tensor_info_as_contiguous(input_info);
++        g_tcim_api.tcim_tensor_info_destroy(input_info);
++        tcim_tensor_t input_tensor = g_tcim_api.tcim_tensor_create_host(input_info_contiguous, 0, nullptr);
++        g_tcim_api.tcim_tensor_info_destroy(input_info_contiguous);
++        if (input_tensor) {
++            prefill_input_map_.insert(std::pair<std::string, tcim_tensor_t>(input_name, input_tensor));
++        }
++    }
++    // 填充prefill_length_ & n_prefill_batch_
++    n_prefill_batch_ = 1;
++    if (!prefill_input_map_.empty()) {
++        const char* first_name = g_tcim_api.tcim_module_get_input_name(prefill_model_, 0);
++        if (first_name) {
++            auto it = prefill_input_map_.find(first_name);
++            if (it != prefill_input_map_.end() && it->second) {
++                tcim_tensor_info_t info = g_tcim_api.tcim_tensor_get_info(it->second);
++                if (info) {
++                    size_t shape_num = g_tcim_api.tcim_tensor_info_get_shape_num(info);
++                    if (shape_num >= 2) {
++                        int64_t dim0 = g_tcim_api.tcim_tensor_info_get_shape_dim(info, 0);
++                        int64_t dim1 = g_tcim_api.tcim_tensor_info_get_shape_dim(info, 1);
++                        prefill_length_ = (dim0 * dim1) / n_prefill_batch_;
++                    }
++                    g_tcim_api.tcim_tensor_info_destroy(info);
++                }
++            }
++        }
++    }
++    // 填充prefill 的output
++    int output_num = g_tcim_api.tcim_module_get_output_num(prefill_model_);
++    for (int idx = 0; idx < output_num; idx++) {
++        const char* output_name_c = g_tcim_api.tcim_module_get_output_name(prefill_model_, idx);
++        if (!output_name_c) continue;
++        std::string output_name(output_name_c);
++        LLAMA_LOG_INFO("%s: prefill output_name: %s\n", __func__,
++                       output_name.c_str());
++        tcim_tensor_info_t output_info = g_tcim_api.tcim_module_get_output_info(prefill_model_, output_name_c);
++        if (!output_info) continue;
++        tcim_tensor_info_t output_info_contiguous = g_tcim_api.tcim_tensor_info_as_contiguous(output_info);
++        g_tcim_api.tcim_tensor_info_destroy(output_info);
++        tcim_tensor_info_t output_info_float = g_tcim_api.tcim_tensor_info_as_type(output_info_contiguous, TCIM_FLOAT32);
++        g_tcim_api.tcim_tensor_info_destroy(output_info_contiguous);
++        tcim_tensor_t output_tensor = g_tcim_api.tcim_tensor_create_host(output_info_float, 0, nullptr);
++        g_tcim_api.tcim_tensor_info_destroy(output_info_float);
++        if (output_tensor) {
++            prefill_output_map_.insert(std::pair<std::string, tcim_tensor_t>(output_name, output_tensor));
++            prefill_output_names_.push_back(output_name);
++        }
++    }
++    // init decode
++    int input_num_decode = g_tcim_api.tcim_module_get_input_num(decode_model_);
++    for (int idx = 0; idx < input_num_decode; idx++) {
++        const char* input_name_c = g_tcim_api.tcim_module_get_input_name(decode_model_, idx);
++        if (!input_name_c) continue;
++        std::string input_name(input_name_c);
++        if (input_name.find("past_key_cache_") != std::string::npos ||
++            input_name.find("_self_attn_vcache") != std::string::npos ||
++            input_name.find("_self_attn_kcache") != std::string::npos) {
++            continue;
++        }
++        LLAMA_LOG_INFO("%s: decode input_name: %s\n", __func__,
++                       input_name.c_str());
++        tcim_tensor_info_t input_info = g_tcim_api.tcim_module_get_input_info(decode_model_, input_name_c);
++        if (!input_info) continue;
++        tcim_tensor_info_t input_info_contiguous = g_tcim_api.tcim_tensor_info_as_contiguous(input_info);
++        g_tcim_api.tcim_tensor_info_destroy(input_info);
++        tcim_tensor_t input_tensor = g_tcim_api.tcim_tensor_create_host(input_info_contiguous, 0, nullptr);
++        g_tcim_api.tcim_tensor_info_destroy(input_info_contiguous);
++        if (input_tensor) {
++            decode_input_map_.insert(std::pair<std::string, tcim_tensor_t>(input_name, input_tensor));
++        }
++    }
++    // 填充n_decode_batch_
++    if (!decode_input_map_.empty()) {
++        const char* first_name = g_tcim_api.tcim_module_get_input_name(decode_model_, 0);
++        if (first_name) {
++            auto it = decode_input_map_.find(first_name);
++            if (it != decode_input_map_.end() && it->second) {
++                tcim_tensor_info_t info = g_tcim_api.tcim_tensor_get_info(it->second);
++                if (info) {
++                    n_decode_batch_ = g_tcim_api.tcim_tensor_info_get_shape_dim(info, 0);
++                    g_tcim_api.tcim_tensor_info_destroy(info);
++                }
++            }
++        }
++    }
++
++    // 填充decode 的output
++    int output_num_decode = g_tcim_api.tcim_module_get_output_num(decode_model_);
++    for (int idx = 0; idx < output_num_decode; idx++) {
++        const char* output_name_c = g_tcim_api.tcim_module_get_output_name(decode_model_, idx);
++        if (!output_name_c) continue;
++        std::string output_name(output_name_c);
++        tcim_tensor_info_t output_info = g_tcim_api.tcim_module_get_output_info(decode_model_, output_name_c);
++        if (!output_info) continue;
++        tcim_tensor_info_t output_info_contiguous = g_tcim_api.tcim_tensor_info_as_contiguous(output_info);
++        g_tcim_api.tcim_tensor_info_destroy(output_info);
++        tcim_tensor_info_t output_info_float = g_tcim_api.tcim_tensor_info_as_type(output_info_contiguous, TCIM_FLOAT32);
++        g_tcim_api.tcim_tensor_info_destroy(output_info_contiguous);
++        tcim_tensor_t output_tensor = g_tcim_api.tcim_tensor_create_host(output_info_float, 0, nullptr);
++        g_tcim_api.tcim_tensor_info_destroy(output_info_float);
++        if (output_tensor) {
++            decode_output_map_.insert(std::pair<std::string, tcim_tensor_t>(output_name, output_tensor));
++            decode_output_names_.push_back(output_name);
++        }
++    }
++    if (seq_max > 4) {
++        LLAMA_LOG_ERROR("%s: seq_max > 4 not supported, set seq_max to 4\n",
++                        __func__);
++        seq_max = 4;
++    }
++    int size = (seq_max + n_prefill_batch_ - 1) / n_prefill_batch_;
++    size = std::max(size, n_decode_batch_);
++    for (int i = 0; i < size; i++) {
++        kv_cache_item item;
++        item.seq_id = i;
++        for (int idx = 0; idx < n_blocks_; idx++) {
++            std::string k_cache_name = "model_layers_" + std::to_string(idx) +
++                                       "_self_attn_kcache_input";
++            std::string v_cache_name = "model_layers_" + std::to_string(idx) +
++                                       "_self_attn_vcache_input";
++
++            item.names.push_back(k_cache_name);
++            item.names.push_back(v_cache_name);
++
++            if (n_decode_batch_ > 1) {
++                k_cache_name = k_cache_name + "_batch" +
++                               std::to_string(i);
++                v_cache_name = v_cache_name + "_batch" +
++                               std::to_string(i);
++            }
++            tcim_tensor_t kcache = g_tcim_api.tcim_module_get_dev_input(decode_model_, k_cache_name.c_str());
++            tcim_tensor_t vcache = g_tcim_api.tcim_module_get_dev_input(decode_model_, v_cache_name.c_str());
++            if (n_decode_batch_ > 1 || seq_max == 1) {
++                item.tensors.push_back(kcache);
++                item.tensors.push_back(vcache);
++            } else {
++                tcim_tensor_t kcache_clone = g_tcim_api.tcim_tensor_clone(kcache);
++                tcim_tensor_t vcache_clone = g_tcim_api.tcim_tensor_clone(vcache);
++                item.tensors.push_back(kcache_clone);
++                item.tensors.push_back(vcache_clone);
++                need_set_kv_cache_ = 1;
++            }
++            if (kcache) {
++                tcim_tensor_info_t kinfo = g_tcim_api.tcim_tensor_get_info(kcache);
++                if (kinfo) {
++                    size_t shape_num = g_tcim_api.tcim_tensor_info_get_shape_num(kinfo);
++                    if (shape_num >= 2) {
++                        int64_t dim_last = g_tcim_api.tcim_tensor_info_get_shape_dim(kinfo, shape_num - 1);
++                        int64_t dim_prev = g_tcim_api.tcim_tensor_info_get_shape_dim(kinfo, shape_num - 2);
++                        context_length_ = std::max(dim_last, dim_prev);
++                    }
++                    g_tcim_api.tcim_tensor_info_destroy(kinfo);
++                }
++            }
++        }
++        kv_cache_[i] = item;
++    }
++    // lora_mask from index 3.
++    for (size_t index = 3; index < input_names_.size(); ++index) {
++        auto prefill_it = prefill_input_map_.find(input_names_[index]);
++        auto decode_it = decode_input_map_.find(input_names_[index]);
++        if (prefill_it != prefill_input_map_.end() && decode_it != decode_input_map_.end()) {
++            tcim_tensor_t lora_mask = prefill_it->second;
++            SetInputData<uint16_t>(lora_mask, 1, 0);
++            g_tcim_api.tcim_module_set_input(prefill_model_, input_names_[index].c_str(), lora_mask);
++            tcim_tensor_t decode_lora_mask = decode_it->second;
++            SetInputData<uint16_t>(decode_lora_mask, 1, 0);
++            g_tcim_api.tcim_module_set_input(decode_model_, input_names_[index].c_str(), decode_lora_mask);
++
++            tcim_tensor_info_t lora_info = g_tcim_api.tcim_tensor_get_info(lora_mask);
++            if (lora_info) {
++                tcim_tensor_info_t lora_info_contiguous = g_tcim_api.tcim_tensor_info_as_contiguous(lora_info);
++                g_tcim_api.tcim_tensor_info_destroy(lora_info);
++                tcim_tensor_info_t lora_info_float = g_tcim_api.tcim_tensor_info_as_type(lora_info_contiguous, TCIM_FLOAT32);
++                g_tcim_api.tcim_tensor_info_destroy(lora_info_contiguous);
++                lora_mask_float_ = g_tcim_api.tcim_tensor_create_host(lora_info_float, 0, nullptr);
++                g_tcim_api.tcim_tensor_info_destroy(lora_info_float);
++            }
++            LLAMA_LOG_INFO("set %d to %s\n", 0, input_names_[index].c_str());
++        }
++    }
++
++    // KV cache init.
++    LLAMA_LOG_INFO("%s: kvcache init finished\n", __func__);
++
++    // set current_length of decode input
++    const char* decode_input_name_2 = g_tcim_api.tcim_module_get_input_name(decode_model_, 2);
++    if (decode_input_name_2) {
++        auto it = decode_input_map_.find(decode_input_name_2);
++        if (it != decode_input_map_.end() && it->second) {
++            tcim_tensor_t decode_current_length = it->second;
++            tcim_data_type_t dtype = g_tcim_api.tcim_tensor_get_data_type(decode_current_length);
++            if (dtype == TCIM_INT16) {
++                SetInputData<int16_t>(decode_current_length, n_decode_batch_, 1);
++            } else if (dtype == TCIM_INT32) {
++                SetInputData<int32_t>(decode_current_length, n_decode_batch_, 1);
++            }
++            g_tcim_api.tcim_module_set_input(decode_model_, decode_input_name_2, decode_current_length);
++        }
++    }
++    LLAMA_LOG_INFO("%s: HMM graph init success\n", __func__);
++    LLAMA_LOG_INFO("prefill_length_ = %d\n context_length_ = %d\n "
++                   "n_blocks_ = %d\n n_embd_ = %ld\n n_prefill_batch_ = %d\n "
++                   "n_decode_batch_ = "
++                   "%d\n   kv_cache_size = %zu\n need_set_kv_cache_ = %d, "
++                   "prefill_input_num "
++                   "= %d， decode_input_num = %d\n",
++                   prefill_length_, context_length_, n_blocks_, n_embd_,
++                   n_prefill_batch_, n_decode_batch_, kv_cache_.size(),
++                   need_set_kv_cache_, input_num, input_num_decode);
++
++    // Cache output tensors for get_output_into reuse
++    if (!prefill_output_names_.empty()) {
++        prefill_output_raw_ = g_tcim_api.tcim_module_get_output(
++            prefill_model_, prefill_output_names_[0].c_str());
++    }
++    if (!decode_output_names_.empty()) {
++        decode_output_raw_ = g_tcim_api.tcim_module_get_output(
++            decode_model_, decode_output_names_[0].c_str());
++    }
++}
++
++int HouMoLLModel::Impl::houmo_prefill(std::vector<llama_token> &tokens, int seq_id,
++                                float *logits) {
++    LLAMA_LOG_DEBUG("%s seq_id = %d, tokens size is = %zu\n", "prefill stage",
++                   seq_id, tokens.size());
++    size_t input_echo_len = tokens.size();
++    if (input_echo_len == 0) {
++        return 0;
++    }
++    int16_t prefill_loop_round = ceil(static_cast<float>(input_echo_len) /
++                                      static_cast<float>(prefill_length_));
++    int32_t current_length = 0;
++    if ((input_echo_len + kv_offset_[seq_id]) >= (size_t)context_length_) {
++        LLAMA_LOG_WARN("tokens size is %zu exceeds context_length_(%d)\n",
++                       input_echo_len, context_length_);
++        return 1;
++    }
++    std::vector<llama_token> input_ids;
++    int32_t valid_length = kv_offset_[seq_id];
++    for (int round = 0; round < prefill_loop_round; round++) {
++        if (round == prefill_loop_round - 1) {
++            current_length = input_echo_len - round * prefill_length_;
++            auto first = tokens.begin() + round * prefill_length_;
++            auto last = tokens.begin() + input_echo_len;
++            std::vector<llama_token> round_tokens(first, last);
++            input_ids = round_tokens;
++        } else {
++            current_length = prefill_length_;
++            auto first = tokens.begin() + round * prefill_length_;
++            auto last = tokens.begin() + (round + 1) * prefill_length_;
++            std::vector<llama_token> round_tokens(first, last);
++            input_ids = round_tokens;
++        }
++        LLAMA_LOG_DEBUG("prefill round = %d, valid_length = %d, current_length = %d\n", round, valid_length, current_length);
++        const char* input_name_0 = g_tcim_api.tcim_module_get_input_name(prefill_model_, 0);
++        auto input_it = prefill_input_map_.find(input_name_0 ? input_name_0 : "");
++        if (input_it != prefill_input_map_.end() && input_it->second) {
++            tcim_tensor_t input_data = input_it->second;
++            memset(g_tcim_api.tcim_tensor_get_data(input_data), 0, g_tcim_api.tcim_tensor_get_mem_size(input_data));
++            embedding_layer_->get_embedding_batch(input_ids, g_tcim_api.tcim_tensor_get_data(input_data));
++            g_tcim_api.tcim_module_set_input(prefill_model_, input_name_0, input_data);
++        }
++
++        const char* input_name_1_c = g_tcim_api.tcim_module_get_input_name(prefill_model_, 1);
++        std::string input_name_1 = input_name_1_c ? std::string(input_name_1_c) : std::string();
++        const char* input_name_2_c = g_tcim_api.tcim_module_get_input_name(prefill_model_, 2);
++        std::string input_name_2 = input_name_2_c ? std::string(input_name_2_c) : std::string();
++        if (!input_name_1.empty() && !input_name_2.empty()) {
++            auto valid_it = prefill_input_map_.find(input_name_1);
++            auto current_it = prefill_input_map_.find(input_name_2);
++            if (valid_it != prefill_input_map_.end() && valid_it->second &&
++                current_it != prefill_input_map_.end() && current_it->second) {
++                tcim_tensor_t prefill_valid_length = valid_it->second;
++                tcim_tensor_t prefill_current_length = current_it->second;
++
++                tcim_data_type_t current_dtype = g_tcim_api.tcim_tensor_get_data_type(prefill_current_length);
++                if (current_dtype == TCIM_INT16) {
++                    SetInputData<int16_t>(prefill_valid_length, n_prefill_batch_, valid_length);
++                    SetInputData<int16_t>(prefill_current_length, n_prefill_batch_, current_length);
++                } else if (current_dtype == TCIM_INT32) {
++                    SetInputData<int32_t>(prefill_valid_length, n_prefill_batch_, valid_length);
++                    SetInputData<int32_t>(prefill_current_length, n_prefill_batch_, current_length);
++                }
++
++                LLAMA_LOG_DEBUG("%s = %d, %s = %d\n", input_name_1.c_str(), valid_length, input_name_2.c_str(), current_length);
++                g_tcim_api.tcim_module_set_input(prefill_model_, input_name_1.c_str(), prefill_valid_length);
++                g_tcim_api.tcim_module_set_input(prefill_model_, input_name_2.c_str(), prefill_current_length);
++            }
++        }
++
++        for (const auto& pair : lora_map) {
++            auto lora_it = prefill_input_map_.find(pair.first);
++            if (lora_it != prefill_input_map_.end() && lora_it->second && lora_mask_float_) {
++                tcim_tensor_t lora_mask = lora_it->second;
++                g_tcim_api.tcim_tensor_copy_from_host(lora_mask_float_, &pair.second.scale, g_tcim_api.tcim_tensor_get_mem_size(lora_mask_float_), 0);
++                g_tcim_api.tcim_tensor_cast_to(lora_mask_float_, lora_mask);
++                g_tcim_api.tcim_module_set_input(prefill_model_, pair.first.c_str(), lora_mask);
++                LLAMA_LOG_DEBUG("%s input set val = %f\n", pair.first.c_str(), pair.second.scale);
++            }
++        }
++
++        auto &item = kv_cache_[seq_id];
++        assert(item.seq_id == seq_id);
++        for (size_t idx = 0; idx < item.tensors.size(); idx++) {
++            std::string name = item.names[idx];
++            tcim_tensor_t tensor = item.tensors[idx];
++            g_tcim_api.tcim_module_set_input(prefill_model_, name.c_str(), tensor);
++        }
++        g_tcim_api.tcim_module_run(prefill_model_);
++        g_tcim_api.tcim_module_sync(prefill_model_);
++        valid_length += prefill_length_;
++    }
++
++    if (logits != nullptr && !prefill_output_names_.empty()) {
++        g_tcim_api.tcim_module_get_output_into(
++            prefill_model_, prefill_output_names_[0].c_str(), prefill_output_raw_);
++        // 转浮点
++        auto output_it = prefill_output_map_.find(prefill_output_names_[0]);
++        if (output_it != prefill_output_map_.end() && output_it->second) {
++            tcim_tensor_t prefill_output_float = output_it->second;
++            g_tcim_api.tcim_tensor_cast_to(prefill_output_raw_, prefill_output_float);
++            memcpy(logits,
++                   g_tcim_api.tcim_tensor_get_data(prefill_output_float),
++                   g_tcim_api.tcim_tensor_get_mem_size(prefill_output_float));
++        }
++    }
++    kv_offset_[seq_id] += input_echo_len;
++    return 0;
++}
++
++int HouMoLLModel::Impl::houmo_decode(std::vector<llama_token> &batches,
++                               std::vector<int> &seq_ids,
++                               std::vector<float *> logits) {
++    LLAMA_LOG_DEBUG("%s: seq_ids size = %zu, batches size = %zu\n", __func__,
++                    seq_ids.size(), batches.size());
++    if (seq_ids.size() > (size_t)n_decode_batch_) {
++        LLAMA_LOG_ERROR("%s: seq_ids.size() > n_decode_batch_ not supported\n", __func__);
++        return -1;
++    }
++
++    if (seq_ids.empty()) {
++        return 0;
++    }
++
++    for (size_t i = 0; i < seq_ids.size(); i++) {
++        int seq_id = seq_ids[i];
++        // Use kv_offset_ as the source of truth for valid length.
++        if (kv_offset_[seq_id] >= context_length_) {
++            LLAMA_LOG_WARN("seq_id %d valid length %d exceeds context_length_ %d\n",
++                           seq_id, kv_offset_[seq_id], context_length_);
++            return 1;
++        }
++    }
++    std::vector<llama_token> input_ids(n_decode_batch_, 0);
++    for (size_t i = 0; i < seq_ids.size(); i++) {
++        int batch_id = seq_ids[i];
++        // 单batch模式下所有序列共用batch 0
++        if (n_decode_batch_ == 1)
++            batch_id = 0;
++        input_ids[batch_id] = batches[i];
++    }
++
++    const char* input_name_0 = g_tcim_api.tcim_module_get_input_name(decode_model_, 0);
++    if (input_name_0) {
++        auto it = decode_input_map_.find(input_name_0);
++        if (it != decode_input_map_.end() && it->second) {
++            tcim_tensor_t input_data = it->second;
++            embedding_layer_->get_embedding_batch(input_ids, g_tcim_api.tcim_tensor_get_data(input_data));
++            g_tcim_api.tcim_module_set_input(decode_model_, input_name_0, input_data);
++        }
++    }
++
++    // set valid_length
++    std::vector<int32_t> valid_length_vec(n_decode_batch_, 1);
++    for (size_t k = 0; k < seq_ids.size(); k++) {
++        int batch_id = seq_ids[k];
++        // 单batch模式下所有序列共用batch 0
++        if (n_decode_batch_ == 1)
++            batch_id = 0;
++        // derive valid length from kv_offset_
++        valid_length_vec[batch_id] = kv_offset_[seq_ids[k]];
++    }
++
++    const char* input_name_1 = g_tcim_api.tcim_module_get_input_name(decode_model_, 1);
++    if (input_name_1) {
++        auto it = decode_input_map_.find(input_name_1);
++        if (it != decode_input_map_.end() && it->second) {
++            tcim_tensor_t decode_valid_length_tensor = it->second;
++            tcim_data_type_t dtype = g_tcim_api.tcim_tensor_get_data_type(decode_valid_length_tensor);
++            if (dtype == TCIM_INT16) {
++                SetInputData<int16_t>(decode_valid_length_tensor, valid_length_vec);
++            } else if (dtype == TCIM_INT32) {
++                SetInputData<int32_t>(decode_valid_length_tensor, valid_length_vec);
++            }
++            g_tcim_api.tcim_module_set_input(decode_model_, input_name_1, decode_valid_length_tensor);
++        }
++    }
++
++    if (need_set_kv_cache_ != 0) {
++        for (auto seq_id : seq_ids) {
++            auto &item = kv_cache_[seq_id];
++            for (size_t idx = 0; idx < item.tensors.size(); idx++) {
++                std::string name = item.names[idx];
++                if (n_decode_batch_ > 1)
++                    name = name + "_batch" +
++                           std::to_string(item.seq_id);
++                tcim_tensor_t tensor = item.tensors[idx];
++                g_tcim_api.tcim_module_set_input(decode_model_, name.c_str(), tensor);
++            }
++        }
++    }
++    for (const auto& pair : lora_map) {
++        auto it = decode_input_map_.find(pair.first);
++        if (it != decode_input_map_.end() && it->second && lora_mask_float_) {
++            tcim_tensor_t lora_mask = it->second;
++            g_tcim_api.tcim_tensor_copy_from_host(lora_mask_float_, &pair.second.scale, g_tcim_api.tcim_tensor_get_mem_size(lora_mask_float_), 0);
++            g_tcim_api.tcim_tensor_cast_to(lora_mask_float_, lora_mask);
++            g_tcim_api.tcim_module_set_input(decode_model_, pair.first.c_str(), lora_mask);
++        }
++    }
++    g_tcim_api.tcim_module_run(decode_model_);
++    g_tcim_api.tcim_module_sync(decode_model_);
++
++    if (!decode_output_names_.empty()) {
++        g_tcim_api.tcim_module_get_output_into(decode_model_, decode_output_names_[0].c_str(), decode_output_raw_);
++    }
++    // 转浮点
++    auto output_it = decode_output_map_.find(decode_output_names_[0]);
++    if (output_it != decode_output_map_.end() && output_it->second) {
++        tcim_tensor_t decode_output_float = output_it->second;
++        g_tcim_api.tcim_tensor_cast_to(decode_output_raw_, decode_output_float);
++        size_t output_mem_size = g_tcim_api.tcim_tensor_get_mem_size(decode_output_float);
++        auto n_vocab = output_mem_size / (n_decode_batch_ * sizeof(float));
++        for (size_t i = 0; i < seq_ids.size(); i++) {
++            auto batch_id = seq_ids[i];
++            // 单batch模式下所有序列共用batch 0
++            if (n_decode_batch_ == 1)
++                batch_id = 0;
++            float *logits_out = logits[i];
++            float *output_ptr = static_cast<float *>(g_tcim_api.tcim_tensor_get_data(decode_output_float)) +
++                                batch_id * n_vocab;
++            memcpy(logits_out, output_ptr, n_vocab * sizeof(float));
++            // kv_offset_ is the canonical counter of tokens in KV cache
++            kv_offset_[batch_id] ++;
++        }
++    }
++    return 0;
++}
++
++void HouMoLLModel::Impl::lora_init(std::string file_path, void *adapter) {
++    struct lora_item item;
++    item.adapter = adapter;
++    item.scale = 0.0;
++    lora_map[file_path] = item;
++    LLAMA_LOG_INFO("lora FILE_name IS %s\n", file_path.c_str());
++}
++
++void HouMoLLModel::Impl::lora_set_scale(void *adapter, float scale) {
++    for (auto iter = lora_map.begin(); iter != lora_map.end(); ++iter) {
++        if (iter->second.adapter == adapter) {
++            iter->second.scale = scale;
++        }
++    }
++}
++
++void HouMoLLModel::Impl::lora_clear() {
++    // scale set 0
++    for (auto iter = lora_map.begin(); iter != lora_map.end(); ++iter) {
++        iter->second.scale = 0;
++    }
++}
++
++void HouMoLLModel::Impl::seq_rm(int seq_id, int p0, int p1) {
++    (void)p1;
++    kv_offset_[seq_id] = std::min(kv_offset_[seq_id], p0);
++}
++
++#else
++// Dummy implementation for non-LLModel builds
++class HouMoLLModel::Impl {
++  public:
++    Impl() = default;
++
++    bool houmo_load(llama_model_loader &loader) {
++        (void)loader;
++        return false;
++    }
++    void houmo_init(int seq_max) {
++        (void)seq_max;
++        // do nothing
++    }
++
++    int houmo_prefill(std::vector<llama_token> &tokens, int seq_id,
++                      float *logits) {
++        (void)tokens;
++        (void)seq_id;
++        (void)logits;
++        return 0;
++    }
++
++    int houmo_decode(std::vector<llama_token> &batches,
++                     std::vector<int> &seq_ids, std::vector<float *> logits) {
++        (void)batches;
++        (void)seq_ids;
++        (void)logits;
++        return 0;
++    }
++    void lora_init(std::string file_path, void *adapter) {
++        (void)file_path;
++        (void)adapter;
++    }
++    void lora_set_scale(void *adapter, float scale) {
++        (void)adapter;
++        (void)scale;
++    }
++    void lora_clear() {
++        // do nothing
++    }
++    void seq_rm(int seq_id, int p0, int p1) {
++        (void)seq_id;
++        (void)p0;
++        (void)p1;
++    }
++    int n_decode_batch() { return -1; }
++    int n_prefill_batch() { return -1; }
++    uint32_t n_context_length() { return 0; }
++};
++#endif
++// HouMoLLModel constructor and destructor
++HouMoLLModel::HouMoLLModel() : impl_(new Impl()) {}
++HouMoLLModel::~HouMoLLModel() { delete impl_; }
++
++// Forward method calls to the implementation
++bool HouMoLLModel::houmo_load(llama_model_loader &loader) {
++    return impl_->houmo_load(loader);
++}
++void HouMoLLModel::houmo_init(int seq_max) { impl_->houmo_init(seq_max); }
++
++int HouMoLLModel::houmo_prefill(std::vector<llama_token> &tokens, int seq_id,
++                                float *logits) {
++    return impl_->houmo_prefill(tokens, seq_id, logits);
++}
++
++int HouMoLLModel::houmo_decode(std::vector<llama_token> &batches,
++                               std::vector<int> &seq_ids,
++                               std::vector<float *> logits) {
++    return impl_->houmo_decode(batches, seq_ids, logits);
++}
++
++int HouMoLLModel::n_decode_batch() { return impl_->n_decode_batch(); }
++
++int HouMoLLModel::n_prefill_batch() { return impl_->n_prefill_batch(); }
++
++uint32_t HouMoLLModel::n_context_length() { return impl_->n_context_length(); }
++void HouMoLLModel::lora_init(std::string file_path, void *adapter) {
++    return impl_->lora_init(file_path, adapter);
++}
++void HouMoLLModel::lora_set_scale(void *adapter, float scale) {
++    return impl_->lora_set_scale(adapter, scale);
++}
++void HouMoLLModel::lora_clear() {
++    return impl_->lora_clear();
++}
++void HouMoLLModel::seq_rm(int seq_id, int p0, int p1) {
++    return impl_->seq_rm(seq_id, p0, p1);
++}
+diff --git a/src/houmo-llmodel.h b/src/houmo-llmodel.h
+new file mode 100644
+index 0000000..a4687df
+--- /dev/null
++++ b/src/houmo-llmodel.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++#include <map>
++#include <string>
++#include <vector>
++
++#include "llama-batch.h"
++#include "llama-model-loader.h"
++// houmo llm model defination
++//
++// @guoxing.xu 2025-05-23
++//
++
++/**
++ * @brief HouMoLLModel is the context for HouMo model.
++ * @details It provides the interface for HouMo model inference.
++ */
++class HouMoLLModel {
++  public:
++    HouMoLLModel();
++    ~HouMoLLModel();
++
++    bool houmo_load(llama_model_loader &loader);
++    void houmo_init(int seq_max = 4);
++    int houmo_prefill(std::vector<llama_token> &tokens, int seq_id,
++                      float *logits);
++    int houmo_decode(std::vector<llama_token> &batches,
++                     std::vector<int> &seq_ids, std::vector<float *> logits);
++    int n_decode_batch();
++    int n_prefill_batch();
++    uint32_t n_context_length();
++    void lora_init(std::string file_name, void *adapter);
++    void lora_set_scale(void *adapter, float scale);
++    void lora_clear();
++    void seq_rm(int seq_id, int p0, int p1);
++  private:
++    class Impl;  // Forward declaration of the implementation class
++    Impl *impl_; // Pointer to the implementation
++};
+\ No newline at end of file
+diff --git a/src/llama-adapter.cpp b/src/llama-adapter.cpp
+index 3074aa8..c616ea2 100644
+--- a/src/llama-adapter.cpp
++++ b/src/llama-adapter.cpp
+@@ -147,7 +147,10 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
+ 
+ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_lora, llama_adapter_lora & adapter, const enum gguf_decrypt_type decrypt_type) {
+     LLAMA_LOG_INFO("%s: loading lora adapter from '%s' ...\n", __func__, path_lora);
+-
++    if (model.hm_llmodel != nullptr) {
++        model.hm_llmodel->lora_init(std::string(path_lora), &adapter);
++        return;
++    }
+     ggml_context * ctx_init;
+     gguf_init_params meta_gguf_params = {
+         /* .no_alloc = */ true,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7ce950e..e034774 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -11,9 +11,30 @@
+ #include <stdexcept>
+ #include <cinttypes>
+ 
+-//
+-// llama_context
+-//
++void llama_context::houmo_init(int32_t seq_max) {
++    std::shared_ptr<HouMoLLModel> hm_llmodel = model.hm_llmodel;
++    hm_llmodel->houmo_init(seq_max);
++    LLAMA_LOG_INFO("%s: HMM graph init success\n", __func__);
++    // 修正n_ctx
++    cparams.n_ctx = cparams.n_ctx < hm_llmodel->n_context_length()
++                        ? cparams.n_ctx
++                        : hm_llmodel->n_context_length();
++    if (cparams.n_ubatch < 256) {
++        cparams.n_ubatch = 256;
++        cparams.n_batch = cparams.n_ubatch;
++    }
++    // graph outputs buffer
++    {
++        // resized during inference when a batch uses more outputs
++        if (output_reserve(seq_max) < seq_max) {
++            throw std::runtime_error("failed to reserve initial output buffer");
++        }
++
++        LLAMA_LOG_INFO("%s: %10s  output buffer size = %8.2f MiB\n", __func__,
++                ggml_backend_buffer_name    (buf_output.get()),
++                ggml_backend_buffer_get_size(buf_output.get()) / 1024.0 / 1024.0);
++    }
++}
+ 
+ llama_context::llama_context(
+         const llama_model & model,
+@@ -95,8 +116,11 @@ llama_context::llama_context(
+ 
+     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+ 
+-    const uint32_t n_ctx_per_seq = cparams.n_ctx / cparams.n_seq_max;
+-
++    uint32_t n_ctx_per_seq = cparams.n_ctx / cparams.n_seq_max;
++    if (hparams.is_hmm) {
++        houmo_init(cparams.n_seq_max);
++        n_ctx_per_seq = cparams.n_ctx;
++    }
+     LLAMA_LOG_INFO("%s: n_seq_max     = %u\n",   __func__, cparams.n_seq_max);
+     LLAMA_LOG_INFO("%s: n_ctx         = %u\n",   __func__, cparams.n_ctx);
+     LLAMA_LOG_INFO("%s: n_ctx_per_seq = %u\n",   __func__, n_ctx_per_seq);
+@@ -119,7 +143,7 @@ llama_context::llama_context(
+ 
+     logits_all = params.logits_all;
+ 
+-    if (!hparams.vocab_only) {
++    if (!hparams.vocab_only && !hparams.is_hmm) {
+         // GPU backends
+         for (auto * dev : model.devices) {
+             ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+@@ -177,7 +201,7 @@ llama_context::llama_context(
+ 
+     // init the memory module
+     // TODO: for now, always create a unified KV cache
+-    if (!hparams.vocab_only) {
++    if (!hparams.vocab_only && !hparams.is_hmm) {
+         kv_self.reset(static_cast<llama_kv_cache_unified *>(model.create_memory()));
+ 
+         LLAMA_LOG_DEBUG("%s: n_ctx = %u\n", __func__, cparams.n_ctx);
+@@ -217,7 +241,7 @@ llama_context::llama_context(
+     }
+ 
+     // init backends
+-    if (!hparams.vocab_only) {
++    if (!hparams.vocab_only && !hparams.is_hmm) {
+         LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
+ 
+         backend_buft.clear();
+@@ -284,7 +308,7 @@ llama_context::llama_context(
+     }
+ 
+     // reserve worst-case graph
+-    if (!hparams.vocab_only) {
++    if (!hparams.vocab_only && !hparams.is_hmm) {
+         const uint32_t n_seqs = 1; // TODO: worst-case number of sequences
+         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+ 
+@@ -375,6 +399,10 @@ llama_context::llama_context(
+ llama_context::~llama_context() = default;
+ 
+ void llama_context::synchronize() {
++    if (model.hparams.is_hmm) {
++        // TODO: @guoxing.xu. synchronize HMM graph
++        return;
++    }
+     ggml_backend_sched_synchronize(sched.get());
+ 
+     // FIXME: if multiple single tokens are evaluated without a synchronization,
+@@ -413,6 +441,9 @@ uint32_t llama_context::n_ctx() const {
+ }
+ 
+ uint32_t llama_context::n_ctx_per_seq() const {
++    if (model.hparams.is_hmm) {
++        return cparams.n_ctx;
++    }
+     return cparams.n_ctx / cparams.n_seq_max;
+ }
+ 
+@@ -1040,6 +1071,9 @@ void llama_context::set_adapter_lora(
+     LLAMA_LOG_DEBUG("%s: adapter = %p, scale = %f\n", __func__, (void *) adapter, scale);
+ 
+     loras[adapter] = scale;
++    if (model.hparams.is_hmm) {
++        model.hm_llmodel->lora_set_scale(adapter, scale);
++    }
+ }
+ 
+ bool llama_context::rm_adapter_lora(
+@@ -1049,6 +1083,9 @@ bool llama_context::rm_adapter_lora(
+     auto pos = loras.find(adapter);
+     if (pos != loras.end()) {
+         loras.erase(pos);
++        if (model.hparams.is_hmm) {
++            model.hm_llmodel->lora_set_scale(adapter, 0.0);
++        }
+         return true;
+     }
+ 
+@@ -1057,7 +1094,9 @@ bool llama_context::rm_adapter_lora(
+ 
+ void llama_context::clear_adapter_lora() {
+     LLAMA_LOG_DEBUG("%s: call\n", __func__);
+-
++    if (model.hparams.is_hmm) {
++        model.hm_llmodel->lora_clear();
++    }
+     loras.clear();
+ }
+ 
+@@ -1235,6 +1274,107 @@ int llama_context::encode(llama_batch & inp_batch) {
+ 
+     return 0;
+ }
++static std::string common_token_to_piece(const struct llama_vocab * vocab, llama_token token, bool special) {
++    std::string piece;
++    piece.resize(piece.capacity());  // using string internal cache, 15 bytes + '\n'
++    const int n_chars = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
++    if (n_chars < 0) {
++        piece.resize(-n_chars);
++        int check = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
++        GGML_ASSERT(check == -n_chars);
++    }
++    else {
++        piece.resize(n_chars);
++    }
++
++    return piece;
++}
++
++int llama_context::houmo_decode(const llama_batch &batch) {
++    LLAMA_LOG_DEBUG("****batch.n_tokens: %d\n", batch.n_tokens);
++    std::shared_ptr<HouMoLLModel> hm_llmodel = model.hm_llmodel;
++    const int32_t n_vocab = model.vocab.n_tokens();
++    int ret = 0;
++    // 记录每个序列
++    int n_parallel = 1;
++    std::map<int, std::vector<llama_token>> seqid_token_map;
++    std::map<int, int> seqid_pos_map;
++    int pos = 0;
++    // 恢复不同seq的tokens, 没有序列信息默认seq_id=0
++    int seq_id = 0;
++    // reserve output buffer
++    if (batch.seq_id == nullptr) {
++        // 单序列推理
++        for (int j = 0; j < batch.n_tokens; j++) {
++            if (seqid_token_map.count(seq_id) == 0)
++                seqid_token_map[seq_id] = std::vector<llama_token>();
++            seqid_token_map[seq_id].push_back(batch.token[j]);
++        }
++        // keep last output only
++        output_ids[batch.n_tokens - 1] = seq_id;
++    } else {
++        // 多序列推理
++        for (int j = 0; j < batch.n_tokens; j++) {
++            for (int s = 0; s < batch.n_seq_id[j]; s++) {
++                seq_id = batch.seq_id[j][s];
++                if (seqid_token_map.count(seq_id) == 0)
++                    seqid_token_map[seq_id] = std::vector<llama_token>();
++                seqid_token_map[seq_id].push_back(batch.token[j]);
++                // 记录不同序列的logits位置
++                if (batch.logits && batch.logits[j] == 1) {
++                    // std::cout << "set output_ids[" << j << "] = " << pos << std::endl;
++                    output_ids[j] = pos;
++                    seqid_pos_map[seq_id] = pos;
++                    pos++;
++                }
++            }
++        }
++    }
++    n_parallel = seqid_token_map.size();
++
++    int n_outputs_all = n_parallel;
++    std::vector<llama_token> decode_batches;
++    std::vector<int > seq_ids;
++    // 先计算已经存在的decode
++    for (auto &[k, v] : seqid_token_map) {
++        // prefill阶段
++        if (v.size() == 1) {
++            // 缓存需要decode的batch
++            decode_batches.push_back(v[0]);
++            seq_ids.push_back(k);
++        }
++    }
++    for (size_t i = 0; i < decode_batches.size();
++         i += hm_llmodel->n_decode_batch()) {
++        int n_decode_batch =
++            std::min(hm_llmodel->n_decode_batch(), (int)decode_batches.size());
++        std::vector<llama_token> decode_batch(decode_batches.begin() + i,
++                                              decode_batches.begin() + i +
++                                                  n_decode_batch);
++        std::vector<int> seq_id(seq_ids.begin() + i,
++                                seq_ids.begin() + i + n_decode_batch);
++        std::vector<float *> logits_ptrs;
++        for (auto seq : seq_id) {
++            logits_ptrs.push_back(logits + seqid_pos_map[seq] * n_vocab);
++        }
++        ret = hm_llmodel->houmo_decode(decode_batch, seq_id, logits_ptrs);
++    }
++
++    // 再计算需要prefill的seq
++    for (auto &[k, v] : seqid_token_map) {
++        // prefill阶段
++        if (v.size() > 1) {
++            // std::cout <<k <<"prefill seq_id pos " << seqid_pos_map[k] << std::endl;
++            auto logits_out = logits + seqid_pos_map[k] * n_vocab;
++            ret = hm_llmodel->houmo_prefill(v, k, logits_out);
++        }
++    }
++    n_outputs = n_outputs_all;
++    if (abort_callback && abort_callback(abort_callback_data)) {
++        return 2;
++    }
++    return ret;
++}
+ 
+ int llama_context::decode(llama_batch & inp_batch) {
+     if (inp_batch.n_tokens == 0) {
+@@ -1242,6 +1382,9 @@ int llama_context::decode(llama_batch & inp_batch) {
+         return -1;
+     }
+ 
++    if (model.hparams.is_hmm) {
++        return houmo_decode(inp_batch);
++    }
+     // temporary allocate memory for the input batch if needed
+     // TODO: this is incorrect for multiple sequences because pos_max() is the maximum across all sequences
+     llama_batch_allocr batch_allocr(inp_batch, inp_batch.pos ? -1 : kv_self->pos_max() + 1);
+@@ -2650,6 +2793,10 @@ bool llama_kv_self_seq_rm(
+          llama_seq_id   seq_id,
+             llama_pos   p0,
+             llama_pos   p1) {
++    if (ctx->get_model().hparams.is_hmm) {
++        ctx->get_model().hm_llmodel->seq_rm(seq_id, p0, p1);
++        return true;
++    }
+     return llama_kv_cache_seq_rm(ctx->get_kv_self(), seq_id, p0, p1);
+ }
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 5e13971..2cd7dfa 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -10,7 +10,6 @@
+ 
+ #include <map>
+ #include <vector>
+-
+ struct llama_model;
+ struct llama_kv_cache;
+ 
+@@ -134,6 +133,9 @@ struct llama_context {
+     void perf_reset();
+ 
+ private:
++    // houmo patch for decoding
++    void houmo_init(int32_t n_seq_max);
++    int houmo_decode(const llama_batch &batch);
+     //
+     // output
+     //
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index bb17ba8..5ffd131 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -25,6 +25,8 @@ struct llama_hparams_convnext {
+ };
+ 
+ struct llama_hparams {
++    // TODO: check if these are still needed. add by guoxing.xu
++    bool is_hmm;
+     bool vocab_only;
+     bool rope_finetuned;
+     bool use_par_res;
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 0471071..9eccdd5 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -447,6 +447,7 @@ llama_model_loader::llama_model_loader(
+         bool check_tensors,
+         const struct llama_model_kv_override * param_overrides_p,
+         const enum gguf_decrypt_type decrypt_type) {
++    fname_ = fname;
+     int trace = 0;
+     if (getenv("LLAMA_TRACE")) {
+         trace = atoi(getenv("LLAMA_TRACE"));
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index 1d10e2d..a9efad5 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -89,7 +89,8 @@ struct llama_model_loader {
+     size_t size_done = 0;
+     size_t size_data = 0;
+     std::vector<std::pair<size_t, size_t>> mmaps_used;
+-
++    // TODO: add by guoxing.xu to store the name of the model
++    std::string fname_;
+     llama_model_loader(
+         const std::string & fname,
+         std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 6e58a77..b3319ac 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1352,6 +1352,12 @@ void llama_model::load_vocab(llama_model_loader & ml) {
+ 
+     vocab.load(ml, kv);
+ }
++bool llama_model::load_hmmodels(llama_model_loader & ml) {
++    if (hm_llmodel == nullptr) {
++        hm_llmodel = std::make_shared<HouMoLLModel>();
++    }
++    return hm_llmodel->houmo_load(ml);
++}
+ 
+ bool llama_model::load_tensors(llama_model_loader & ml) {
+     const auto & split_mode   = params.split_mode;
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 9e676ec..b99e2bf 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -7,6 +7,8 @@
+ #include "llama-memory.h"
+ #include "llama-vocab.h"
+ 
++#include "houmo-llmodel.h"
++
+ #include <memory>
+ #include <string>
+ #include <unordered_map>
+@@ -315,6 +317,8 @@ struct llama_model {
+     llama_hparams hparams = {};
+     llama_vocab   vocab;
+ 
++    std::shared_ptr<HouMoLLModel> hm_llmodel = nullptr;
++
+     struct ggml_tensor * tok_embd   = nullptr;
+     struct ggml_tensor * type_embd  = nullptr;
+     struct ggml_tensor * pos_embd   = nullptr;
+@@ -362,6 +366,8 @@ struct llama_model {
+     void load_hparams(llama_model_loader & ml);
+     void load_vocab  (llama_model_loader & ml);
+     bool load_tensors(llama_model_loader & ml); // returns false if cancelled by progress_callback
++    // TODO: @guoxing.xu check again.
++    bool load_hmmodels(llama_model_loader & ml);
+ 
+     std::string arch_name() const;
+     std::string type_name() const;
+diff --git a/src/llama.cpp b/src/llama.cpp
+index f0ba8ac..07c06bd 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -121,6 +121,11 @@ static int llama_model_load(const std::string & fname, std::vector<std::string>
+             LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
+             return 0;
+         }
++        model.hparams.is_hmm = model.gguf_kv.count("is_hmm") > 0;
++        LLAMA_LOG_INFO("%s:%d: loading hmmodes %d\n", __func__, __LINE__, model.hparams.is_hmm);
++        if (model.hparams.is_hmm) {
++            return model.load_hmmodels(ml) ? 0 : -1;
++        }
+ 
+         if (!model.load_tensors(ml)) {
+             return -2;
+diff --git a/src/tcim_c_api.h b/src/tcim_c_api.h
+new file mode 100644
+index 0000000..db074d0
+--- /dev/null
++++ b/src/tcim_c_api.h
+@@ -0,0 +1,500 @@
++/*
++ * Copyright (c) 2026 The Houmo.ai Authors. All rights reserved.
++ */
++
++#ifndef TCIM_C_API_H
++#define TCIM_C_API_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* ============================================================================
++ * Handle types (opaque pointers to C++ objects)
++ * ============================================================================ */
++typedef struct tcim_dev_manager* tcim_dev_manager_t;
++typedef struct tcim_weight_manager* tcim_weight_manager_t;
++typedef struct tcim_module_option* tcim_module_option_t;
++typedef struct tcim_module* tcim_module_t;
++typedef struct tcim_tensor* tcim_tensor_t;
++typedef struct tcim_tensor_info* tcim_tensor_info_t;
++typedef struct tcim_buffer* tcim_buffer_t;
++
++/* ============================================================================
++ * Status codes
++ * ============================================================================ */
++typedef enum {
++    TCIM_OK = 0,
++    TCIM_ERR_UNDEFINED = -1,
++    TCIM_UNINITIALIZED = 1,
++    TCIM_OUT_OF_RANGE = 2,
++    TCIM_UNSUPPORTED = 3,
++    TCIM_INVALID_ARGUMENT = 4,
++    TCIM_ALREADY_EXISTS = 5,
++    TCIM_PERMISSION_DENIED = 6,
++    TCIM_UNAVAILABLE = 7,
++    TCIM_UNAUTHENTICATED = 8,
++    TCIM_RESOURCE_EXHAUSTED = 9,
++    TCIM_TIMEOUT = 10,
++    TCIM_ERR_KERNEL = 11,
++    TCIM_ERR_FATAL = 12,
++} tcim_status_t;
++
++/* ============================================================================
++ * Data types
++ * ============================================================================ */
++typedef enum {
++    TCIM_INT8 = 0,
++    TCIM_UINT8 = 1,
++    TCIM_INT16 = 2,
++    TCIM_UINT16 = 3,
++    TCIM_INT32 = 4,
++    TCIM_UINT32 = 5,
++    TCIM_FLOAT16 = 6,
++    TCIM_FLOAT32 = 7,
++} tcim_data_type_t;
++
++/* ============================================================================
++ * Device types
++ * ============================================================================ */
++typedef enum {
++    TCIM_CPU = 0,
++    TCIM_HDPL = 1,
++    TCIM_DEV_INNER = 3,
++    TCIM_COMPND = 5,
++    TCIM_BLOCK_ND = 6,
++} tcim_device_t;
++
++/* ============================================================================
++ * DevManager API
++ * ============================================================================ */
++typedef tcim_dev_manager_t (*tcim_dev_manager_create_fn)(const int* device_ids, size_t num_devices, const char* backend_name);
++typedef void (*tcim_dev_manager_destroy_fn)(tcim_dev_manager_t dev_manager);
++
++/* ============================================================================
++ * WeightManager API
++ * ============================================================================ */
++typedef tcim_weight_manager_t (*tcim_weight_manager_create_fn)(tcim_dev_manager_t dev_manager);
++typedef void (*tcim_weight_manager_destroy_fn)(tcim_weight_manager_t weight_manager);
++
++/* ============================================================================
++ * Module::Option API
++ * ============================================================================ */
++typedef tcim_module_option_t (*tcim_module_option_create_fn)(tcim_weight_manager_t weight_manager);
++typedef void (*tcim_module_option_destroy_fn)(tcim_module_option_t option);
++typedef void (*tcim_module_option_set_dummy_tensors_fn)(tcim_module_option_t option, const char** tensor_names, size_t num_tensors);
++typedef void (*tcim_module_option_enable_lazy_mode_fn)(tcim_module_option_t option, bool enable);
++typedef void (*tcim_module_option_set_model_offset_fn)(tcim_module_option_t option, size_t offset, size_t size);
++
++/* ============================================================================
++ * Module API
++ * ============================================================================ */
++typedef tcim_module_t (*tcim_module_create_fn)(void);
++typedef void (*tcim_module_destroy_fn)(tcim_module_t module);
++typedef tcim_status_t (*tcim_module_load_model_file_fn)(tcim_module_t module, const char* filename, tcim_module_option_t option);
++typedef tcim_status_t (*tcim_module_load_model_mem_fn)(tcim_module_t module, const void* data, uint64_t len, tcim_module_option_t option);
++typedef size_t (*tcim_module_get_input_num_fn)(tcim_module_t module);
++typedef const char* (*tcim_module_get_input_name_fn)(tcim_module_t module, int index);
++typedef tcim_tensor_info_t (*tcim_module_get_input_info_fn)(tcim_module_t module, const char* name);
++typedef size_t (*tcim_module_get_output_num_fn)(tcim_module_t module);
++typedef const char* (*tcim_module_get_output_name_fn)(tcim_module_t module, int index);
++typedef tcim_tensor_info_t (*tcim_module_get_output_info_fn)(tcim_module_t module, const char* name);
++typedef tcim_tensor_t (*tcim_module_get_dev_input_fn)(tcim_module_t module, const char* name);
++typedef tcim_status_t (*tcim_module_set_input_fn)(tcim_module_t module, const char* name, tcim_tensor_t tensor);
++typedef tcim_status_t (*tcim_module_run_fn)(tcim_module_t module);
++typedef tcim_status_t (*tcim_module_sync_fn)(tcim_module_t module);
++typedef tcim_tensor_t (*tcim_module_get_output_fn)(tcim_module_t module, const char* name);
++typedef tcim_status_t (*tcim_module_get_output_into_fn)(tcim_module_t module, const char* name, tcim_tensor_t tensor);
++
++/* ============================================================================
++ * TensorInfo API
++ * ============================================================================ */
++typedef void (*tcim_tensor_info_destroy_fn)(tcim_tensor_info_t info);
++typedef tcim_tensor_info_t (*tcim_tensor_info_as_contiguous_fn)(tcim_tensor_info_t info);
++typedef tcim_tensor_info_t (*tcim_tensor_info_as_type_fn)(tcim_tensor_info_t info, tcim_data_type_t dtype);
++typedef size_t (*tcim_tensor_info_get_shape_num_fn)(tcim_tensor_info_t info);
++typedef int64_t (*tcim_tensor_info_get_shape_dim_fn)(tcim_tensor_info_t info, size_t index);
++typedef tcim_data_type_t (*tcim_tensor_info_get_data_type_fn)(tcim_tensor_info_t info);
++typedef size_t (*tcim_tensor_info_get_mem_size_fn)(tcim_tensor_info_t info);
++
++/* ============================================================================
++ * Tensor API
++ * ============================================================================ */
++typedef tcim_tensor_t (*tcim_tensor_create_host_fn)(tcim_tensor_info_t info, size_t mem_size, void* ptr);
++typedef void (*tcim_tensor_destroy_fn)(tcim_tensor_t tensor);
++typedef tcim_tensor_info_t (*tcim_tensor_get_info_fn)(tcim_tensor_t tensor);
++typedef tcim_buffer_t (*tcim_tensor_get_buffer_fn)(tcim_tensor_t tensor);
++typedef size_t (*tcim_tensor_get_mem_size_fn)(tcim_tensor_t tensor);
++typedef void* (*tcim_tensor_get_data_fn)(tcim_tensor_t tensor);
++typedef tcim_tensor_t (*tcim_tensor_clone_fn)(tcim_tensor_t tensor);
++typedef tcim_status_t (*tcim_tensor_cast_to_fn)(tcim_tensor_t tensor, tcim_tensor_t target);
++typedef tcim_status_t (*tcim_tensor_copy_from_host_fn)(tcim_tensor_t tensor, const void* src, size_t size, size_t offset);
++typedef tcim_data_type_t (*tcim_tensor_get_data_type_fn)(tcim_tensor_t tensor);
++
++/* ============================================================================
++ * Buffer API
++ * ============================================================================ */
++typedef void (*tcim_buffer_destroy_fn)(tcim_buffer_t buffer);
++typedef tcim_status_t (*tcim_buffer_copy_from_host_fn)(tcim_buffer_t buffer, const void* src, size_t size, size_t offset);
++
++/* ============================================================================
++ * Function pointer table for dynamic loading
++ * ============================================================================ */
++typedef struct {
++    /* DevManager */
++    tcim_dev_manager_create_fn tcim_dev_manager_create;
++    tcim_dev_manager_destroy_fn tcim_dev_manager_destroy;
++
++    /* WeightManager */
++    tcim_weight_manager_create_fn tcim_weight_manager_create;
++    tcim_weight_manager_destroy_fn tcim_weight_manager_destroy;
++
++    /* Module::Option */
++    tcim_module_option_create_fn tcim_module_option_create;
++    tcim_module_option_destroy_fn tcim_module_option_destroy;
++    tcim_module_option_set_dummy_tensors_fn tcim_module_option_set_dummy_tensors;
++    tcim_module_option_enable_lazy_mode_fn tcim_module_option_enable_lazy_mode;
++    tcim_module_option_set_model_offset_fn tcim_module_option_set_model_offset;
++
++    /* Module */
++    tcim_module_create_fn tcim_module_create;
++    tcim_module_destroy_fn tcim_module_destroy;
++    tcim_module_load_model_file_fn tcim_module_load_model_file;
++    tcim_module_load_model_mem_fn tcim_module_load_model_mem;
++    tcim_module_get_input_num_fn tcim_module_get_input_num;
++    tcim_module_get_input_name_fn tcim_module_get_input_name;
++    tcim_module_get_input_info_fn tcim_module_get_input_info;
++    tcim_module_get_output_num_fn tcim_module_get_output_num;
++    tcim_module_get_output_name_fn tcim_module_get_output_name;
++    tcim_module_get_output_info_fn tcim_module_get_output_info;
++    tcim_module_get_dev_input_fn tcim_module_get_dev_input;
++    tcim_module_set_input_fn tcim_module_set_input;
++    tcim_module_run_fn tcim_module_run;
++    tcim_module_sync_fn tcim_module_sync;
++    tcim_module_get_output_fn tcim_module_get_output;
++    tcim_module_get_output_into_fn tcim_module_get_output_into;
++
++    /* TensorInfo */
++    tcim_tensor_info_destroy_fn tcim_tensor_info_destroy;
++    tcim_tensor_info_as_contiguous_fn tcim_tensor_info_as_contiguous;
++    tcim_tensor_info_as_type_fn tcim_tensor_info_as_type;
++    tcim_tensor_info_get_shape_num_fn tcim_tensor_info_get_shape_num;
++    tcim_tensor_info_get_shape_dim_fn tcim_tensor_info_get_shape_dim;
++    tcim_tensor_info_get_data_type_fn tcim_tensor_info_get_data_type;
++    tcim_tensor_info_get_mem_size_fn tcim_tensor_info_get_mem_size;
++
++    /* Tensor */
++    tcim_tensor_create_host_fn tcim_tensor_create_host;
++    tcim_tensor_destroy_fn tcim_tensor_destroy;
++    tcim_tensor_get_info_fn tcim_tensor_get_info;
++    tcim_tensor_get_buffer_fn tcim_tensor_get_buffer;
++    tcim_tensor_get_mem_size_fn tcim_tensor_get_mem_size;
++    tcim_tensor_get_data_fn tcim_tensor_get_data;
++    tcim_tensor_clone_fn tcim_tensor_clone;
++    tcim_tensor_cast_to_fn tcim_tensor_cast_to;
++    tcim_tensor_copy_from_host_fn tcim_tensor_copy_from_host;
++    tcim_tensor_get_data_type_fn tcim_tensor_get_data_type;
++
++    /* Buffer */
++    tcim_buffer_destroy_fn tcim_buffer_destroy;
++    tcim_buffer_copy_from_host_fn tcim_buffer_copy_from_host;
++} tcim_api_table_t;
++
++/* ============================================================================
++ * Dynamic loading function
++ * ============================================================================ */
++
++/**
++ * Load TCIM runtime library and initialize function pointers
++ * @param library_path Path to the tcim runtime library (e.g., "tcim_runtime.dll" or "libtcim_runtime.so")
++ * @param api_table Output parameter to receive the function pointer table
++ * @return true on success, false on failure
++ */
++bool tcim_load_library(const char* library_path, tcim_api_table_t* api_table);
++
++/**
++ * Unload TCIM runtime library
++ */
++void tcim_unload_library(void);
++
++/**
++ * Get the last error message
++ */
++const char* tcim_get_last_error(void);
++
++/* ============================================================================
++ * RAII wrappers for C++ usage
++ * ============================================================================ */
++
++#ifdef __cplusplus
++
++namespace tcim_c_api {
++
++// Wrapper class for DevManager
++class DevManager {
++public:
++    DevManager(tcim_dev_manager_t handle, tcim_api_table_t* api) : handle_(handle), api_(api) {}
++    ~DevManager() { if (handle_ && api_) api_->tcim_dev_manager_destroy(handle_); }
++
++    DevManager(const DevManager&) = delete;
++    DevManager& operator=(const DevManager&) = delete;
++
++    DevManager(DevManager&& other) noexcept : handle_(other.handle_), api_(other.api_) {
++        other.handle_ = nullptr;
++        other.api_ = nullptr;
++    }
++
++    tcim_dev_manager_t handle() const { return handle_; }
++
++private:
++    tcim_dev_manager_t handle_;
++    tcim_api_table_t* api_;
++};
++
++// Wrapper class for WeightManager
++class WeightManager {
++public:
++    WeightManager(tcim_weight_manager_t handle, tcim_api_table_t* api) : handle_(handle), api_(api) {}
++    ~WeightManager() { if (handle_ && api_) api_->tcim_weight_manager_destroy(handle_); }
++
++    WeightManager(const WeightManager&) = delete;
++    WeightManager& operator=(const WeightManager&) = delete;
++
++    WeightManager(WeightManager&& other) noexcept : handle_(other.handle_), api_(other.api_) {
++        other.handle_ = nullptr;
++        other.api_ = nullptr;
++    }
++
++    tcim_weight_manager_t handle() const { return handle_; }
++
++private:
++    tcim_weight_manager_t handle_;
++    tcim_api_table_t* api_;
++};
++
++// Wrapper class for Module::Option
++class ModuleOption {
++public:
++    ModuleOption(tcim_module_option_t handle, tcim_api_table_t* api) : handle_(handle), api_(api) {}
++    ~ModuleOption() { if (handle_ && api_) api_->tcim_module_option_destroy(handle_); }
++
++    ModuleOption(const ModuleOption&) = delete;
++    ModuleOption& operator=(const ModuleOption&) = delete;
++
++    ModuleOption(ModuleOption&& other) noexcept : handle_(other.handle_), api_(other.api_) {
++        other.handle_ = nullptr;
++        other.api_ = nullptr;
++    }
++
++    void SetDummyTensors(const char** tensor_names, size_t num_tensors) {
++        if (api_) api_->tcim_module_option_set_dummy_tensors(handle_, tensor_names, num_tensors);
++    }
++
++    void EnableLazyMode(bool enable) {
++        if (api_) api_->tcim_module_option_enable_lazy_mode(handle_, enable);
++    }
++
++    void SetModelOffset(size_t offset, size_t size) {
++        if (api_) api_->tcim_module_option_set_model_offset(handle_, offset, size);
++    }
++
++    tcim_module_option_t handle() const { return handle_; }
++
++private:
++    tcim_module_option_t handle_;
++    tcim_api_table_t* api_;
++};
++
++// Forward declaration
++class Tensor;
++
++// Wrapper class for TensorInfo
++class TensorInfo {
++public:
++    TensorInfo(tcim_tensor_info_t handle, tcim_api_table_t* api) : handle_(handle), api_(api) {}
++    ~TensorInfo() { if (handle_ && api_) api_->tcim_tensor_info_destroy(handle_); }
++
++    TensorInfo(const TensorInfo&) = delete;
++    TensorInfo& operator=(const TensorInfo&) = delete;
++
++    TensorInfo(TensorInfo&& other) noexcept : handle_(other.handle_), api_(other.api_) {
++        other.handle_ = nullptr;
++        other.api_ = nullptr;
++    }
++
++    TensorInfo AsContiguous();
++    TensorInfo AsType(tcim_data_type_t dtype);
++
++    size_t GetShapeNum() const {
++        return api_ ? api_->tcim_tensor_info_get_shape_num(handle_) : 0;
++    }
++
++    int64_t GetShapeDim(size_t index) const {
++        return api_ ? api_->tcim_tensor_info_get_shape_dim(handle_, index) : 0;
++    }
++
++    tcim_data_type_t GetDataType() const {
++        return api_ ? api_->tcim_tensor_info_get_data_type(handle_) : TCIM_FLOAT32;
++    }
++
++    size_t GetMemSize() const {
++        return api_ ? api_->tcim_tensor_info_get_mem_size(handle_) : 0;
++    }
++
++    tcim_tensor_info_t handle() const { return handle_; }
++
++private:
++    tcim_tensor_info_t handle_;
++    tcim_api_table_t* api_;
++};
++
++// Wrapper class for Tensor
++class Tensor {
++public:
++    Tensor() : handle_(nullptr), api_(nullptr) {}
++    Tensor(tcim_tensor_t handle, tcim_api_table_t* api) : handle_(handle), api_(api) {}
++    ~Tensor() { if (handle_ && api_) api_->tcim_tensor_destroy(handle_); }
++
++    Tensor(const Tensor&) = delete;
++    Tensor& operator=(const Tensor&) = delete;
++
++    Tensor(Tensor&& other) noexcept : handle_(other.handle_), api_(other.api_) {
++        other.handle_ = nullptr;
++        other.api_ = nullptr;
++    }
++
++    TensorInfo GetInfo() const {
++        if (!api_) return TensorInfo(nullptr, nullptr);
++        return TensorInfo(api_->tcim_tensor_get_info(handle_), api_);
++    }
++
++    tcim_buffer_t GetBuffer() const {
++        return api_ ? api_->tcim_tensor_get_buffer(handle_) : nullptr;
++    }
++
++    size_t GetMemSize() const {
++        return api_ ? api_->tcim_tensor_get_mem_size(handle_) : 0;
++    }
++
++    void* GetData() const {
++        return api_ ? api_->tcim_tensor_get_data(handle_) : nullptr;
++    }
++
++    Tensor Clone() {
++        if (!api_) return Tensor(nullptr, nullptr);
++        return Tensor(api_->tcim_tensor_clone(handle_), api_);
++    }
++
++    tcim_status_t CastTo(Tensor& target) {
++        if (!api_) return TCIM_ERR_UNDEFINED;
++        return api_->tcim_tensor_cast_to(handle_, target.handle());
++    }
++
++    tcim_tensor_t handle() const { return handle_; }
++
++private:
++    tcim_tensor_t handle_;
++    tcim_api_table_t* api_;
++};
++
++// Wrapper class for Module
++class Module {
++public:
++    Module(tcim_module_t handle, tcim_api_table_t* api) : handle_(handle), api_(api) {}
++    ~Module() { if (handle_ && api_) api_->tcim_module_destroy(handle_); }
++
++    Module(const Module&) = delete;
++    Module& operator=(const Module&) = delete;
++
++    Module(Module&& other) noexcept : handle_(other.handle_), api_(other.api_) {
++        other.handle_ = nullptr;
++        other.api_ = nullptr;
++    }
++
++    tcim_status_t LoadModel(const char* filename, tcim_module_option_t option) {
++        return api_ ? api_->tcim_module_load_model_file(handle_, filename, option) : TCIM_ERR_UNDEFINED;
++    }
++
++    tcim_status_t LoadModel(const void* data, uint64_t len, tcim_module_option_t option) {
++        return api_ ? api_->tcim_module_load_model_mem(handle_, data, len, option) : TCIM_ERR_UNDEFINED;
++    }
++
++    size_t GetInputNum() const {
++        return api_ ? api_->tcim_module_get_input_num(handle_) : 0;
++    }
++
++    const char* GetInputName(int index) const {
++        return api_ ? api_->tcim_module_get_input_name(handle_, index) : nullptr;
++    }
++
++    TensorInfo GetInputInfo(const char* name) const {
++        if (!api_) return TensorInfo(nullptr, nullptr);
++        return TensorInfo(api_->tcim_module_get_input_info(handle_, name), api_);
++    }
++
++    size_t GetOutputNum() const {
++        return api_ ? api_->tcim_module_get_output_num(handle_) : 0;
++    }
++
++    const char* GetOutputName(int index) const {
++        return api_ ? api_->tcim_module_get_output_name(handle_, index) : nullptr;
++    }
++
++    TensorInfo GetOutputInfo(const char* name) const {
++        if (!api_) return TensorInfo(nullptr, nullptr);
++        return TensorInfo(api_->tcim_module_get_output_info(handle_, name), api_);
++    }
++
++    Tensor GetDevInput(const char* name) {
++        if (!api_) return Tensor(nullptr, nullptr);
++        return Tensor(api_->tcim_module_get_dev_input(handle_, name), api_);
++    }
++
++    tcim_status_t SetInput(const char* name, const Tensor& tensor) {
++        return api_ ? api_->tcim_module_set_input(handle_, name, tensor.handle()) : TCIM_ERR_UNDEFINED;
++    }
++
++    tcim_status_t Run() {
++        return api_ ? api_->tcim_module_run(handle_) : TCIM_ERR_UNDEFINED;
++    }
++
++    tcim_status_t Sync() {
++        return api_ ? api_->tcim_module_sync(handle_) : TCIM_ERR_UNDEFINED;
++    }
++
++    Tensor GetOutput(const char* name) {
++        if (!api_) return Tensor(nullptr, nullptr);
++        return Tensor(api_->tcim_module_get_output(handle_, name), api_);
++    }
++
++    tcim_module_t handle() const { return handle_; }
++
++private:
++    tcim_module_t handle_;
++    tcim_api_table_t* api_;
++};
++
++// Implementation of TensorInfo methods that depend on Tensor
++inline TensorInfo TensorInfo::AsContiguous() {
++    if (!api_) return TensorInfo(nullptr, nullptr);
++    return TensorInfo(api_->tcim_tensor_info_as_contiguous(handle_), api_);
++}
++
++inline TensorInfo TensorInfo::AsType(tcim_data_type_t dtype) {
++    if (!api_) return TensorInfo(nullptr, nullptr);
++    return TensorInfo(api_->tcim_tensor_info_as_type(handle_, dtype), api_);
++}
++
++} // namespace tcim_c_api
++
++#endif /* __cplusplus */
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* TCIM_C_API_H */
+diff --git a/src/tcim_c_api_loader.h b/src/tcim_c_api_loader.h
+new file mode 100644
+index 0000000..82c4a42
+--- /dev/null
++++ b/src/tcim_c_api_loader.h
+@@ -0,0 +1,154 @@
++/*
++ * Copyright (c) 2026 The Houmo.ai Authors. All rights reserved.
++ * Dynamic loader for TCIM C API
++ */
++
++#ifndef TCIM_C_API_LOADER_H
++#define TCIM_C_API_LOADER_H
++
++#include "tcim_c_api.h"
++#include <cstdlib>
++#include <cstring>
++
++#ifdef _WIN32
++    #include <windows.h>
++#else
++    #include <dlfcn.h>
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#ifdef _WIN32
++    static HMODULE g_tcim_library_handle = nullptr;
++#else
++    static void* g_tcim_library_handle = nullptr;
++#endif
++
++static char g_tcim_last_error[256] = {0};
++
++static void set_tcim_error(const char* msg) {
++    strncpy(g_tcim_last_error, msg, sizeof(g_tcim_last_error) - 1);
++    g_tcim_last_error[sizeof(g_tcim_last_error) - 1] = '\0';
++}
++
++const char* tcim_get_last_error(void) {
++    return g_tcim_last_error;
++}
++
++bool tcim_load_library(const char* library_path, tcim_api_table_t* api_table) {
++    if (!library_path || !api_table) {
++        set_tcim_error("Invalid arguments");
++        return false;
++    }
++
++    if (g_tcim_library_handle) {
++        // Already loaded
++        return true;
++    }
++
++#ifdef _WIN32
++    g_tcim_library_handle = LoadLibraryA(library_path);
++    if (!g_tcim_library_handle) {
++        set_tcim_error("Failed to load library");
++        return false;
++    }
++
++    #define GET_PROC(name) GetProcAddress(g_tcim_library_handle, name)
++#else
++    g_tcim_library_handle = dlopen(library_path, RTLD_NOW | RTLD_LOCAL);
++    if (!g_tcim_library_handle) {
++        set_tcim_error(dlerror());
++        return false;
++    }
++
++    #define GET_PROC(name) dlsym(g_tcim_library_handle, name)
++#endif
++
++    // Load all function pointers
++    api_table->tcim_dev_manager_create = (tcim_dev_manager_create_fn)GET_PROC("tcim_dev_manager_create_impl");
++    api_table->tcim_dev_manager_destroy = (tcim_dev_manager_destroy_fn)GET_PROC("tcim_dev_manager_destroy_impl");
++
++    api_table->tcim_weight_manager_create = (tcim_weight_manager_create_fn)GET_PROC("tcim_weight_manager_create_impl");
++    api_table->tcim_weight_manager_destroy = (tcim_weight_manager_destroy_fn)GET_PROC("tcim_weight_manager_destroy_impl");
++
++    api_table->tcim_module_option_create = (tcim_module_option_create_fn)GET_PROC("tcim_module_option_create_impl");
++    api_table->tcim_module_option_destroy = (tcim_module_option_destroy_fn)GET_PROC("tcim_module_option_destroy_impl");
++    api_table->tcim_module_option_set_dummy_tensors = (tcim_module_option_set_dummy_tensors_fn)GET_PROC("tcim_module_option_set_dummy_tensors_impl");
++    api_table->tcim_module_option_enable_lazy_mode = (tcim_module_option_enable_lazy_mode_fn)GET_PROC("tcim_module_option_enable_lazy_mode_impl");
++    api_table->tcim_module_option_set_model_offset = (tcim_module_option_set_model_offset_fn)GET_PROC("tcim_module_option_set_model_offset_impl");
++
++    api_table->tcim_module_create = (tcim_module_create_fn)GET_PROC("tcim_module_create_impl");
++    api_table->tcim_module_destroy = (tcim_module_destroy_fn)GET_PROC("tcim_module_destroy_impl");
++    api_table->tcim_module_load_model_file = (tcim_module_load_model_file_fn)GET_PROC("tcim_module_load_model_file_impl");
++    api_table->tcim_module_load_model_mem = (tcim_module_load_model_mem_fn)GET_PROC("tcim_module_load_model_mem_impl");
++    api_table->tcim_module_get_input_num = (tcim_module_get_input_num_fn)GET_PROC("tcim_module_get_input_num_impl");
++    api_table->tcim_module_get_input_name = (tcim_module_get_input_name_fn)GET_PROC("tcim_module_get_input_name_impl");
++    api_table->tcim_module_get_input_info = (tcim_module_get_input_info_fn)GET_PROC("tcim_module_get_input_info_impl");
++    api_table->tcim_module_get_output_num = (tcim_module_get_output_num_fn)GET_PROC("tcim_module_get_output_num_impl");
++    api_table->tcim_module_get_output_name = (tcim_module_get_output_name_fn)GET_PROC("tcim_module_get_output_name_impl");
++    api_table->tcim_module_get_output_info = (tcim_module_get_output_info_fn)GET_PROC("tcim_module_get_output_info_impl");
++    api_table->tcim_module_get_dev_input = (tcim_module_get_dev_input_fn)GET_PROC("tcim_module_get_dev_input_impl");
++    api_table->tcim_module_set_input = (tcim_module_set_input_fn)GET_PROC("tcim_module_set_input_impl");
++    api_table->tcim_module_run = (tcim_module_run_fn)GET_PROC("tcim_module_run_impl");
++    api_table->tcim_module_sync = (tcim_module_sync_fn)GET_PROC("tcim_module_sync_impl");
++    api_table->tcim_module_get_output = (tcim_module_get_output_fn)GET_PROC("tcim_module_get_output_impl");
++    api_table->tcim_module_get_output_into = (tcim_module_get_output_into_fn)GET_PROC("tcim_module_get_output_into_impl");
++
++    api_table->tcim_tensor_info_destroy = (tcim_tensor_info_destroy_fn)GET_PROC("tcim_tensor_info_destroy_impl");
++    api_table->tcim_tensor_info_as_contiguous = (tcim_tensor_info_as_contiguous_fn)GET_PROC("tcim_tensor_info_as_contiguous_impl");
++    api_table->tcim_tensor_info_as_type = (tcim_tensor_info_as_type_fn)GET_PROC("tcim_tensor_info_as_type_impl");
++    api_table->tcim_tensor_info_get_shape_num = (tcim_tensor_info_get_shape_num_fn)GET_PROC("tcim_tensor_info_get_shape_num_impl");
++    api_table->tcim_tensor_info_get_shape_dim = (tcim_tensor_info_get_shape_dim_fn)GET_PROC("tcim_tensor_info_get_shape_dim_impl");
++    api_table->tcim_tensor_info_get_data_type = (tcim_tensor_info_get_data_type_fn)GET_PROC("tcim_tensor_info_get_data_type_impl");
++    api_table->tcim_tensor_info_get_mem_size = (tcim_tensor_info_get_mem_size_fn)GET_PROC("tcim_tensor_info_get_mem_size_impl");
++
++    api_table->tcim_tensor_create_host = (tcim_tensor_create_host_fn)GET_PROC("tcim_tensor_create_host_impl");
++    api_table->tcim_tensor_destroy = (tcim_tensor_destroy_fn)GET_PROC("tcim_tensor_destroy_impl");
++    api_table->tcim_tensor_get_info = (tcim_tensor_get_info_fn)GET_PROC("tcim_tensor_get_info_impl");
++    api_table->tcim_tensor_get_buffer = (tcim_tensor_get_buffer_fn)GET_PROC("tcim_tensor_get_buffer_impl");
++    api_table->tcim_tensor_get_mem_size = (tcim_tensor_get_mem_size_fn)GET_PROC("tcim_tensor_get_mem_size_impl");
++    api_table->tcim_tensor_get_data = (tcim_tensor_get_data_fn)GET_PROC("tcim_tensor_get_data_impl");
++    api_table->tcim_tensor_clone = (tcim_tensor_clone_fn)GET_PROC("tcim_tensor_clone_impl");
++    api_table->tcim_tensor_cast_to = (tcim_tensor_cast_to_fn)GET_PROC("tcim_tensor_cast_to_impl");
++    api_table->tcim_tensor_copy_from_host = (tcim_tensor_copy_from_host_fn)GET_PROC("tcim_tensor_copy_from_host_impl");
++    api_table->tcim_tensor_get_data_type = (tcim_tensor_get_data_type_fn)GET_PROC("tcim_tensor_get_data_type_impl");
++
++    api_table->tcim_buffer_destroy = (tcim_buffer_destroy_fn)GET_PROC("tcim_buffer_destroy_impl");
++    api_table->tcim_buffer_copy_from_host = (tcim_buffer_copy_from_host_fn)GET_PROC("tcim_buffer_copy_from_host_impl");
++
++#undef GET_PROC
++
++    // Verify all function pointers are loaded
++    if (!api_table->tcim_dev_manager_create ||
++        !api_table->tcim_weight_manager_create ||
++        !api_table->tcim_module_option_create ||
++        !api_table->tcim_module_create ||
++        !api_table->tcim_tensor_create_host) {
++        set_tcim_error("Failed to load one or more function pointers");
++        return false;
++    }
++
++    return true;
++}
++
++void tcim_unload_library(void) {
++#ifdef _WIN32
++    if (g_tcim_library_handle) {
++        FreeLibrary(g_tcim_library_handle);
++        g_tcim_library_handle = nullptr;
++    }
++#else
++    if (g_tcim_library_handle) {
++        dlclose(g_tcim_library_handle);
++        g_tcim_library_handle = nullptr;
++    }
++#endif
++}
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* TCIM_C_API_LOADER_H */
+-- 
+2.43.0
+

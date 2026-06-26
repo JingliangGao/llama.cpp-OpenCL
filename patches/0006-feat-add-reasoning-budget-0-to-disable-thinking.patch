@@ -1,0 +1,496 @@
+From a3cdb96eac74b1a5e8db54c29bd0ea7753c7859f Mon Sep 17 00:00:00 2001
+From: luyuhong <luyuhong@kylinos.cn>
+Date: Wed, 25 Mar 2026 16:02:05 +0800
+Subject: [PATCH 06/20] feat: add --reasoning-budget 0 to disable thinking
+
+add reasoning-budget sampler to suppress <think>
+Wire llama-cli to tokenize <think> and force-close reasoning at token level
+
+Task: #599619
+
+From: llama.cpp
+From-Url: https://github.com/ggml-org/llama.cpp.git #e121edc
+
+Severity: Important
+
+Tested-by: luyuhong <luyuhong@kylinos.cn>
+Change-Id: I6e1af393106541ad8586db15d3d0449ca51128e9
+---
+ common/CMakeLists.txt       |   2 +
+ common/arg.cpp              |  15 +++
+ common/common.h             |  12 ++
+ common/reasoning-budget.cpp | 260 ++++++++++++++++++++++++++++++++++++
+ common/reasoning-budget.h   |  54 ++++++++
+ common/sampling.cpp         |  17 ++-
+ examples/main/main.cpp      |  13 ++
+ 7 files changed, 371 insertions(+), 2 deletions(-)
+ create mode 100644 common/reasoning-budget.cpp
+ create mode 100644 common/reasoning-budget.h
+
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index 556b385..5a9ee69 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -75,6 +75,8 @@ add_library(${TARGET}
+     minja/minja.hpp
+     ngram-cache.cpp
+     ngram-cache.h
++    reasoning-budget.cpp
++    reasoning-budget.h
+     sampling.cpp
+     sampling.h
+     speculative.cpp
+diff --git a/common/arg.cpp b/common/arg.cpp
+index d2a65ef..0cb3958 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2131,6 +2131,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             else { std::invalid_argument("invalid value"); }
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MAIN}).set_env("LLAMA_ARG_THINK"));
++    add_opt(common_arg(
++        {"--reasoning-budget"}, "N",
++        "token budget for thinking: -1 for unrestricted, 0 for immediate end, N>0 for token budget (default: -1)",
++        [](common_params & params, int value) {
++            if (value < -1) { throw std::invalid_argument("invalid value"); }
++            params.reasoning_budget = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_THINK_BUDGET"));
++    add_opt(common_arg(
++        {"--reasoning-budget-message"}, "MESSAGE",
++        "message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)",
++        [](common_params & params, const std::string & value) {
++            params.reasoning_budget_message = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
+     add_opt(common_arg(
+         {"--chat-template"}, "JINJA_TEMPLATE",
+         string_format(
+diff --git a/common/common.h b/common/common.h
+index 46a0e00..4207d2c 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -180,6 +180,13 @@ struct common_params_sampling {
+ 
+     std::vector<llama_logit_bias> logit_bias; // logit biases to apply
+ 
++    // reasoning budget sampler parameters
++    // -1 = disabled, >= 0 = token budget
++    int32_t                  reasoning_budget_tokens = -1;
++    std::vector<llama_token> reasoning_budget_start;   // start tag token sequence (e.g. "<think>")
++    std::vector<llama_token> reasoning_budget_end;     // end tag token sequence (e.g. "</think>")
++    std::vector<llama_token> reasoning_budget_forced;  // forced sequence (message + end tag)
++
+     // print the parameters into a string
+     std::string print() const;
+ };
+@@ -287,6 +294,11 @@ struct common_params {
+     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)
+     std::vector<llama_model_kv_override> kv_overrides;
+ 
++    // thinking / reasoning budget
++    // -1 = disabled, 0 = immediate end, N>0 = token budget
++    int reasoning_budget = -1;
++    std::string reasoning_budget_message = "";
++
+     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
+     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
+ 
+diff --git a/common/reasoning-budget.cpp b/common/reasoning-budget.cpp
+new file mode 100644
+index 0000000..573b292
+--- /dev/null
++++ b/common/reasoning-budget.cpp
+@@ -0,0 +1,260 @@
++#include "reasoning-budget.h"
++#include "common.h"
++// NOTE: b4920 does not have common_utf8_is_complete(); we keep it simple and
++// avoid forcing while in the middle of a multi-byte UTF-8 sequence by treating
++// tokens as UTF-8 complete. This is safe and keeps the feature working.
++
++#include "log.h"
++
++#include <cmath>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++struct token_matcher {
++    std::vector<llama_token> tokens;
++    size_t pos = 0;
++
++    bool advance(llama_token token) {
++        if (tokens.empty()) {
++            return false;
++        }
++
++        if (token == tokens[pos]) {
++            pos++;
++            if (pos >= tokens.size()) {
++                pos = 0;
++                return true;
++            }
++        } else {
++            pos = 0;
++            if (token == tokens[0]) {
++                pos = 1;
++            }
++        }
++        return false;
++    }
++
++    void reset() { pos = 0; }
++};
++
++struct common_reasoning_budget_ctx {
++    const llama_vocab * vocab;
++
++    token_matcher start_matcher;
++    token_matcher end_matcher;
++    std::vector<llama_token> forced_tokens;
++
++    int32_t budget;           // maximum tokens in reasoning block
++    int32_t remaining;        // tokens remaining in budget
++
++    common_reasoning_budget_state state;
++
++    // for forcing
++    size_t force_pos;         // next position in forced_tokens to force
++};
++
++static const char * common_reasoning_budget_name(const struct llama_sampler * /*smpl*/) {
++    return "reasoning-budget";
++}
++
++static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_token token) {
++    auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
++
++    switch (ctx->state) {
++        case REASONING_BUDGET_IDLE:
++        {
++            if (ctx->start_matcher.advance(token)) {
++                ctx->state = REASONING_BUDGET_COUNTING;
++                ctx->remaining = ctx->budget;
++                LOG_INF("reasoning-budget: activated, budget=%d tokens\n", ctx->budget);
++
++                if (ctx->remaining <= 0) {
++                    ctx->state = REASONING_BUDGET_FORCING;
++                    ctx->force_pos = 0;
++                    LOG_INF("reasoning-budget: budget=0, forcing immediately\n");
++                }
++            }
++            break;
++        }
++        case REASONING_BUDGET_COUNTING:
++        case REASONING_BUDGET_WAITING_UTF8:
++        {
++            if (ctx->end_matcher.advance(token)) {
++                ctx->state = REASONING_BUDGET_DONE;
++                LOG_INF("reasoning-budget: deactivated (natural end)\n");
++                break;
++            }
++
++            bool utf8_complete = true;
++            (void) ctx->vocab;
++            (void) token;
++
++            if (ctx->state == REASONING_BUDGET_WAITING_UTF8) {
++                if (utf8_complete) {
++                    ctx->state = REASONING_BUDGET_FORCING;
++                    ctx->force_pos = 0;
++                    ctx->end_matcher.reset();
++                    LOG_INF("reasoning-budget: UTF-8 complete, now forcing end sequence\n");
++                }
++            } else if (ctx->state == REASONING_BUDGET_COUNTING) {
++                ctx->remaining--;
++                if (ctx->remaining <= 0) {
++                    if (utf8_complete) {
++                        ctx->state = REASONING_BUDGET_FORCING;
++                        ctx->force_pos = 0;
++                        ctx->end_matcher.reset();
++                        LOG_INF("reasoning-budget: budget exhausted, forcing end sequence\n");
++                    } else {
++                        ctx->state = REASONING_BUDGET_WAITING_UTF8;
++                        ctx->end_matcher.reset();
++                        LOG_INF("reasoning-budget: budget exhausted, waiting for UTF-8 completion\n");
++                    }
++                }
++            }
++            break;
++        }
++        case REASONING_BUDGET_FORCING:
++            // force_pos is advanced in apply(), not here.
++            // This ensures the first forced token isn't skipped when the sampler
++            // is initialized directly in FORCING state (e.g. COUNTING + budget=0)
++            break;
++        case REASONING_BUDGET_DONE:
++            break;
++    }
++}
++
++static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
++    auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
++
++    if (ctx->state != REASONING_BUDGET_FORCING) {
++        // passthrough — don't modify logits
++        return;
++    }
++
++    if (ctx->force_pos >= ctx->forced_tokens.size()) {
++        return;
++    }
++
++    const llama_token forced = ctx->forced_tokens[ctx->force_pos];
++
++    // set all logits to -inf except the forced token
++    for (size_t i = 0; i < cur_p->size; i++) {
++        if (cur_p->data[i].id != forced) {
++            cur_p->data[i].logit = -INFINITY;
++        }
++    }
++
++    // advance to next forced token (done here rather than in accept so that
++    // the first forced token isn't skipped when starting in FORCING state)
++    ctx->force_pos++;
++    if (ctx->force_pos >= ctx->forced_tokens.size()) {
++        ctx->state = REASONING_BUDGET_DONE;
++        LOG_INF("reasoning-budget: forced sequence complete, done\n");
++    }
++}
++
++static void common_reasoning_budget_reset(struct llama_sampler * smpl) {
++    auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
++    ctx->state = REASONING_BUDGET_IDLE;
++    ctx->remaining = ctx->budget;
++    ctx->start_matcher.reset();
++    ctx->end_matcher.reset();
++    ctx->force_pos = 0;
++}
++
++// forward declaration for use in clone
++static struct llama_sampler * common_reasoning_budget_init_state(
++        const struct llama_vocab * vocab, const std::vector<llama_token> & start_tokens,
++        const std::vector<llama_token> & end_tokens, const std::vector<llama_token> & forced_tokens,
++        int32_t budget, common_reasoning_budget_state initial_state);
++
++static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl) {
++    const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
++    return common_reasoning_budget_init_state(
++        ctx->vocab,
++        ctx->start_matcher.tokens,
++        ctx->end_matcher.tokens,
++        ctx->forced_tokens,
++        ctx->budget,
++        ctx->state);
++}
++
++static void common_reasoning_budget_free(struct llama_sampler * smpl) {
++    delete (common_reasoning_budget_ctx *) smpl->ctx;
++}
++
++static struct llama_sampler_i common_reasoning_budget_i = {
++    /* .name              = */ common_reasoning_budget_name,
++    /* .accept            = */ common_reasoning_budget_accept,
++    /* .apply             = */ common_reasoning_budget_apply,
++    /* .reset             = */ common_reasoning_budget_reset,
++    /* .clone             = */ common_reasoning_budget_clone,
++    /* .free              = */ common_reasoning_budget_free,
++};
++
++static struct llama_sampler * common_reasoning_budget_init_state(
++        const struct llama_vocab             * vocab,
++        const std::vector<llama_token>       & start_tokens,
++        const std::vector<llama_token>       & end_tokens,
++        const std::vector<llama_token>       & forced_tokens,
++        int32_t                                budget,
++        common_reasoning_budget_state          initial_state) {
++    // promote COUNTING with budget <= 0 to FORCING
++    if (initial_state == REASONING_BUDGET_COUNTING && budget <= 0) {
++        initial_state = REASONING_BUDGET_FORCING;
++    }
++
++    return llama_sampler_init(
++        /* .iface = */ &common_reasoning_budget_i,
++        /* .ctx   = */ new common_reasoning_budget_ctx {
++            /* .vocab         = */ vocab,
++            /* .start_matcher = */ { start_tokens, 0 },
++            /* .end_matcher   = */ { end_tokens, 0 },
++            /* .forced_tokens = */ forced_tokens,
++            /* .budget        = */ budget,
++            /* .remaining     = */ budget,
++            /* .state         = */ initial_state,
++            /* .force_pos     = */ 0,
++        }
++    );
++}
++
++struct llama_sampler * common_reasoning_budget_init(
++        const struct llama_vocab       * vocab,
++        const std::vector<llama_token> & start_tokens,
++        const std::vector<llama_token> & end_tokens,
++        const std::vector<llama_token> & forced_tokens,
++        int32_t                          budget,
++        const std::vector<llama_token> & prefill_tokens) {
++    // Determine initial state from prefill: COUNTING if the prefill begins with
++    // the start sequence but does not also contain the end sequence after it.
++    common_reasoning_budget_state initial_state = REASONING_BUDGET_IDLE;
++    if (!prefill_tokens.empty() && !start_tokens.empty() &&
++            prefill_tokens.size() >= start_tokens.size() &&
++            std::equal(start_tokens.begin(), start_tokens.end(), prefill_tokens.begin())) {
++        initial_state = REASONING_BUDGET_COUNTING;
++        // If the end sequence also follows the start in the prefill, reasoning
++        // was opened and immediately closed — stay IDLE.
++        if (!end_tokens.empty() &&
++                prefill_tokens.size() >= start_tokens.size() + end_tokens.size()) {
++            auto end_start = prefill_tokens.end() - (ptrdiff_t) end_tokens.size();
++            if (end_start >= prefill_tokens.begin() + (ptrdiff_t) start_tokens.size() &&
++                    std::equal(end_tokens.begin(), end_tokens.end(), end_start)) {
++                initial_state = REASONING_BUDGET_IDLE;
++            }
++        }
++    }
++    return common_reasoning_budget_init_state(vocab, start_tokens, end_tokens, forced_tokens, budget, initial_state);
++}
++
++struct llama_sampler * common_reasoning_budget_init(
++        const struct llama_vocab       * vocab,
++        const std::vector<llama_token> & start_tokens,
++        const std::vector<llama_token> & end_tokens,
++        const std::vector<llama_token> & forced_tokens,
++        int32_t                          budget,
++        common_reasoning_budget_state    initial_state) {
++    return common_reasoning_budget_init_state(vocab, start_tokens, end_tokens, forced_tokens, budget, initial_state);
++}
++
+diff --git a/common/reasoning-budget.h b/common/reasoning-budget.h
+new file mode 100644
+index 0000000..8bd0dea
+--- /dev/null
++++ b/common/reasoning-budget.h
+@@ -0,0 +1,54 @@
++#pragma once
++
++#include "llama.h"
++
++#include <cstdint>
++#include <vector>
++
++enum common_reasoning_budget_state {
++    REASONING_BUDGET_IDLE,         // waiting for start sequence
++    REASONING_BUDGET_COUNTING,     // counting down tokens
++    REASONING_BUDGET_FORCING,      // forcing budget message + end sequence
++    REASONING_BUDGET_WAITING_UTF8, // budget exhausted, waiting for UTF-8 completion
++    REASONING_BUDGET_DONE,         // passthrough forever
++};
++
++// Creates a reasoning budget sampler that limits token generation inside a
++// reasoning block (e.g. between <think> and </think>).
++//
++// State machine: IDLE -> COUNTING -> WAITING_UTF8 -> FORCING -> DONE
++//   IDLE:         passthrough, watching for start_tokens sequence
++//   COUNTING:     counting down remaining tokens, watching for natural end_tokens
++//   WAITING_UTF8: budget exhausted, allowing tokens to complete a UTF-8 sequence
++//   FORCING:      forces forced_tokens token-by-token (all other logits -> -inf)
++//   DONE:         passthrough forever
++//
++// Parameters:
++//   vocab          - vocabulary (used for UTF-8 boundary detection; can be nullptr)
++//   start_tokens   - token sequence that activates counting
++//   end_tokens     - token sequence for natural deactivation
++//   forced_tokens  - token sequence forced when budget expires
++//   budget         - max tokens allowed in the reasoning block
++//   prefill_tokens - tokens already present in the prompt (generation prompt);
++//                    used to determine the initial state: COUNTING if they begin
++//                    with start_tokens (but don't also end with end_tokens),
++//                    IDLE otherwise. COUNTING with budget <= 0 is promoted to FORCING.
++//
++struct llama_sampler * common_reasoning_budget_init(
++        const struct llama_vocab       * vocab,
++        const std::vector<llama_token> & start_tokens,
++        const std::vector<llama_token> & end_tokens,
++        const std::vector<llama_token> & forced_tokens,
++        int32_t                          budget,
++        const std::vector<llama_token> & prefill_tokens = {});
++
++// Variant that takes an explicit initial state (used by tests and clone).
++// COUNTING with budget <= 0 is promoted to FORCING.
++struct llama_sampler * common_reasoning_budget_init(
++        const struct llama_vocab       * vocab,
++        const std::vector<llama_token> & start_tokens,
++        const std::vector<llama_token> & end_tokens,
++        const std::vector<llama_token> & forced_tokens,
++        int32_t                          budget,
++        common_reasoning_budget_state    initial_state);
++
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index baf2206..f28a35a 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -1,6 +1,7 @@
+ #include "sampling.h"
+ 
+ #include "common.h"
++#include "reasoning-budget.h"
+ 
+ #include <cmath>
+ #include <unordered_map>
+@@ -136,11 +137,13 @@ std::string common_params_sampling::print() const {
+             "\trepeat_last_n = %d, repeat_penalty = %.3f, frequency_penalty = %.3f, presence_penalty = %.3f\n"
+             "\tdry_multiplier = %.3f, dry_base = %.3f, dry_allowed_length = %d, dry_penalty_last_n = %d\n"
+             "\ttop_k = %d, top_p = %.3f, min_p = %.3f, xtc_probability = %.3f, xtc_threshold = %.3f, typical_p = %.3f, top_n_sigma = %.3f, temp = %.3f\n"
+-            "\tmirostat = %d, mirostat_lr = %.3f, mirostat_ent = %.3f",
++            "\tmirostat = %d, mirostat_lr = %.3f, mirostat_ent = %.3f\n"
++            "\treasoning_budget_tokens = %d",
+             penalty_last_n, penalty_repeat, penalty_freq, penalty_present,
+             dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n,
+             top_k, top_p, min_p, xtc_probability, xtc_threshold, typ_p, top_n_sigma, temp,
+-            mirostat, mirostat_eta, mirostat_tau);
++            mirostat, mirostat_eta, mirostat_tau,
++            reasoning_budget_tokens);
+ 
+     return std::string(result);
+ }
+@@ -219,6 +222,16 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, co
+         /* .cur_p  = */ {},
+     };
+ 
++    // reasoning budget sampler — add first so it can force tokens before other samplers
++    if (params.reasoning_budget_tokens >= 0 && !params.reasoning_budget_forced.empty()) {
++        llama_sampler_chain_add(result->chain, common_reasoning_budget_init(
++            vocab,
++            params.reasoning_budget_start,
++            params.reasoning_budget_end,
++            params.reasoning_budget_forced,
++            params.reasoning_budget_tokens));
++    }
++
+     llama_sampler_chain_add(result->chain,
+             llama_sampler_init_logit_bias(
+                 llama_vocab_n_tokens(vocab),
+diff --git a/examples/main/main.cpp b/examples/main/main.cpp
+index cff7f91..5edc0b8 100644
+--- a/examples/main/main.cpp
++++ b/examples/main/main.cpp
+@@ -158,6 +158,19 @@ int main(int argc, char ** argv) {
+     const llama_vocab * vocab = llama_model_get_vocab(model);
+     auto chat_templates = common_chat_templates_init(model, params.chat_template);
+ 
++    // reasoning budget sampler: force close thinking (e.g. Qwen3 <think> ... </think>)
++    // Note: this operates at the token level, so it can reduce wasted compute even if the model emits <think> by itself.
++    if (params.reasoning_budget >= 0) {
++        // Default tags for thinking-style models (Qwen/DeepSeek family)
++        const std::string think_start = "<think>";
++        const std::string think_end   = "</think>";
++
++        sparams.reasoning_budget_tokens = params.reasoning_budget;
++        sparams.reasoning_budget_start  = common_tokenize(ctx, think_start, false, true);
++        sparams.reasoning_budget_end    = common_tokenize(ctx, think_end,   false, true);
++        sparams.reasoning_budget_forced = common_tokenize(ctx, params.reasoning_budget_message + think_end, false, true);
++    }
++
+     LOG_INF("%s: llama threadpool init, n_threads = %d\n", __func__, (int) params.cpuparams.n_threads);
+ 
+     auto * reg = ggml_backend_dev_backend_reg(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+-- 
+2.43.0
+

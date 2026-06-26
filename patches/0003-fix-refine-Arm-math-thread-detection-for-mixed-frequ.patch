@@ -1,0 +1,115 @@
+From de57c1fb2b903c213f027b7be12937887fffbeb3 Mon Sep 17 00:00:00 2001
+From: luyuhong <luyuhong@kylinos.cn>
+Date: Tue, 10 Feb 2026 10:07:09 +0800
+Subject: [PATCH 03/20] fix: refine Arm math thread detection for
+ mixed-frequency cores
+
+Detect heterogeneous max cpu frequencies on aarch64 Linux and derive
+a recommended math thread count instead of returning only the number
+of big cores.
+
+Task: #591921
+
+From: kylin
+
+Severity: Critical
+
+Tested-by: luyuhong <luyuhong@kylinos.cn>
+Change-Id: I59e9b09ca6ae1cfa484ec3fc543db5597369c1d7
+---
+ common/common.cpp | 57 +++++++++++++++++++++++++++++++++++++++++++++++
+ debian/changelog  |  4 ++--
+ 2 files changed, 59 insertions(+), 2 deletions(-)
+
+diff --git a/common/common.cpp b/common/common.cpp
+index adcd2a9..b3a2132 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -208,6 +208,54 @@ static int cpu_count_math_cpus(int n_cpu) {
+ 
+ #endif // __x86_64__ && __linux__
+ 
++#if defined(__aarch64__) && defined(__linux__) && !defined(__ANDROID__)
++static constexpr int kMaxCpuCheck = 128;
++static constexpr double kBigCoreFreqTol = 0.95;
++static constexpr int kMathMinBigMultiple = 2;
++static constexpr int kMathMaxBigMultiple = 3;
++
++static int32_t cpu_get_num_math_arm(int32_t physical_cores) {
++    if (physical_cores <= 0) {
++        return physical_cores;
++    }
++    int n_cpu = (int)sysconf(_SC_NPROCESSORS_CONF);
++    if (n_cpu <= 0 || n_cpu > kMaxCpuCheck) {
++        n_cpu = kMaxCpuCheck;
++    }
++    std::vector<uint64_t> max_freq;
++    max_freq.reserve((size_t)n_cpu);
++    char path[64];
++    for (int cpu = 0; cpu < n_cpu; ++cpu) {
++        int len = snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
++        if (len < 0 || (size_t)len >= sizeof(path)) {
++            break;
++        }
++        std::ifstream f(path);
++        if (!f.is_open()) {
++            break;
++        }
++        uint64_t hz = 0;
++        if (f >> hz) {
++            max_freq.push_back(hz);
++        }
++    }
++    if (max_freq.size() < 2) {
++        return physical_cores;
++    }
++    uint64_t max_hz = *std::max_element(max_freq.begin(), max_freq.end());
++    int32_t big = 0;
++    for (uint64_t hz : max_freq) {
++        if ((double)hz >= max_hz * kBigCoreFreqTol) {
++            ++big;
++        }
++    }
++    if (big > 0 && big < physical_cores) {
++        return std::max(std::min(physical_cores, big * kMathMaxBigMultiple), big * kMathMinBigMultiple);
++    }
++    return physical_cores;
++}
++#endif
++
+ /**
+  * Returns number of CPUs on system that are useful for math.
+  */
+@@ -227,6 +275,15 @@ int32_t cpu_get_num_math() {
+             }
+         }
+     }
++#endif
++#if defined(__aarch64__) && defined(__linux__) && !defined(__ANDROID__)
++    {
++        int32_t physical = cpu_get_num_physical_cores();
++        int32_t math = cpu_get_num_math_arm(physical);
++        if (math > 0) {
++            return math;
++        }
++    }
+ #endif
+     return cpu_get_num_physical_cores();
+ }
+diff --git a/debian/changelog b/debian/changelog
+index 8df58e8..97d481b 100644
+--- a/debian/changelog
++++ b/debian/changelog
+@@ -1,7 +1,7 @@
+-kytensor-llm (2.0.0-ok15k0.6) v11-2603-preview; urgency=medium
++kytensor-llm (2.0.0-ok15k0.7) v11-2603-preview; urgency=medium
+ 
+   * BUG: 无
+-  * 需求: #525831 支持后摩卡大模型推理
++  * 需求: #591921 国产cpu适配,arm cpu线程检测策略优化
+   * 其他改动说明: 无
+   * 其他改动影响域: 无
+ 
+-- 
+2.43.0
+

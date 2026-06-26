@@ -1,0 +1,119 @@
+From ea31221970e8d583314cd1e5624d48be2012a59d Mon Sep 17 00:00:00 2001
+From: luyuhong <luyuhong@kylinos.cn>
+Date: Sat, 4 Apr 2026 17:57:01 +0800
+Subject: [PATCH 08/20] fix: fix unsupport template boolean value error
+
+Add optional chat_template_kwargs to common_chat_format_single so interactive chat matches full-template apply
+implement Minja 'is true' / 'is false' for Qwen3 templates with JSON boolean kwargs
+
+Task: #599619
+
+From: kylin
+
+Severity: Important
+
+Tested-by: luyuhong <luyuhong@kylinos.cn>
+Change-Id: Ibea4cc16dc1ba7abddb4ad92c6a6dceeb011b113
+---
+ common/chat.cpp        |  6 +++++-
+ common/chat.h          |  5 ++++-
+ common/minja/minja.hpp |  3 +++
+ examples/main/main.cpp | 16 ++++++++++++----
+ 4 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/common/chat.cpp b/common/chat.cpp
+index efc3e79..00740ee 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -307,10 +307,14 @@ std::string common_chat_format_single(
+         const std::vector<common_chat_msg> & past_msg,
+         const common_chat_msg & new_msg,
+         bool add_ass,
+-        bool use_jinja) {
++        bool use_jinja,
++        const nlohmann::ordered_json * chat_template_kwargs) {
+ 
+     common_chat_templates_inputs inputs;
+     inputs.use_jinja = use_jinja;
++    if (chat_template_kwargs != nullptr && !chat_template_kwargs->is_null()) {
++        inputs.chat_template_kwargs = *chat_template_kwargs;
++    }
+ 
+     std::string fmt_past_msg;
+     if (!past_msg.empty()) {
+diff --git a/common/chat.h b/common/chat.h
+index 84b97cd..e41fd6f 100644
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -111,12 +111,15 @@ struct common_chat_params      common_chat_templates_apply(
+     const struct common_chat_templates_inputs & inputs);
+ 
+ // Format single message, while taking into account the position of that message in chat history
++// If chat_template_kwargs is non-null, it is passed into Jinja extra_context for both template applies
++// (matches common_chat_templates_apply behaviour in full-prompt paths).
+ std::string common_chat_format_single(
+         const struct common_chat_templates * tmpls,
+         const std::vector<common_chat_msg> & past_msg,
+         const common_chat_msg & new_msg,
+         bool add_ass,
+-        bool use_jinja);
++        bool use_jinja,
++        const nlohmann::ordered_json * chat_template_kwargs = nullptr);
+ 
+ // Returns an example of formatted chat
+ std::string common_chat_format_example(
+diff --git a/common/minja/minja.hpp b/common/minja/minja.hpp
+index fa4c34d..b9be1d6 100644
+--- a/common/minja/minja.hpp
++++ b/common/minja/minja.hpp
+@@ -1293,6 +1293,9 @@ public:
+               if (name == "iterable") return l.is_iterable();
+               if (name == "sequence") return l.is_array();
+               if (name == "defined") return !l.is_null();
++              // Jinja2: `x is true` / `x is false` (strict boolean; e.g. Qwen3 chat_template + JSON kwargs)
++              if (name == "true")  return l.is_boolean() && l.get<bool>();
++              if (name == "false") return l.is_boolean() && !l.get<bool>();
+               throw std::runtime_error("Unknown type for 'is' operator: " + name);
+             };
+             auto value = eval();
+diff --git a/examples/main/main.cpp b/examples/main/main.cpp
+index c56db01..7b5bf01 100644
+--- a/examples/main/main.cpp
++++ b/examples/main/main.cpp
+@@ -278,12 +278,20 @@ int main(int argc, char ** argv) {
+ 
+     std::vector<llama_token> embd_inp;
+ 
++    const nlohmann::ordered_json * cli_template_kwargs_ptr = nullptr;
++    nlohmann::ordered_json         cli_template_kwargs_storage;
++    if (!params.chat_template_kwargs.empty()) {
++        cli_template_kwargs_storage = nlohmann::ordered_json::parse(params.chat_template_kwargs);
++        cli_template_kwargs_ptr     = &cli_template_kwargs_storage;
++    }
++
+     bool waiting_for_first_input = false;
+-    auto chat_add_and_format = [&chat_msgs, &chat_templates](const std::string & role, const std::string & content) {
++    auto chat_add_and_format = [&chat_msgs, &chat_templates, cli_template_kwargs_ptr](const std::string & role, const std::string & content) {
+         common_chat_msg new_msg;
+         new_msg.role = role;
+         new_msg.content = content;
+-        auto formatted = common_chat_format_single(chat_templates.get(), chat_msgs, new_msg, role == "user", g_params->use_jinja);
++        auto formatted = common_chat_format_single(
++            chat_templates.get(), chat_msgs, new_msg, role == "user", g_params->use_jinja, cli_template_kwargs_ptr);
+         chat_msgs.push_back(new_msg);
+         LOG_DBG("formatted: '%s'\n", formatted.c_str());
+         return formatted;
+@@ -308,8 +316,8 @@ int main(int argc, char ** argv) {
+                 common_chat_templates_inputs inputs;
+                 inputs.messages = chat_msgs;
+                 inputs.add_generation_prompt = !params.prompt.empty();
+-                if (!params.chat_template_kwargs.empty()) {
+-                    inputs.chat_template_kwargs = nlohmann::ordered_json::parse(params.chat_template_kwargs);
++                if (cli_template_kwargs_ptr != nullptr) {
++                    inputs.chat_template_kwargs = *cli_template_kwargs_ptr;
+                 }
+ 
+                 prompt = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
+-- 
+2.43.0
+

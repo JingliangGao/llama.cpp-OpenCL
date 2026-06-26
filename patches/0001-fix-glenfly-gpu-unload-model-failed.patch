@@ -1,0 +1,312 @@
+From 8b689fb9727175b20b515d57f12d353636e42d86 Mon Sep 17 00:00:00 2001
+From: lizhenneng <lizhenneng@kylinos.cn>
+Date: Tue, 24 Mar 2026 13:45:39 +0800
+Subject: [PATCH 01/20] fix: glenfly gpu unload model failed
+
+After unload model by kytensor, glenfly gpu's vram can not be recycled.
+Fix memory leak for decrypted lora.
+
+Bug: #507905
+
+Req: yes
+
+From: kylin
+
+Severity: Critical
+
+Tested-by: lizhenneng@kylinos.cn
+Change-Id: I1d91b797445590d98d6e36db05221da2bd56960b
+Signed-off-by: lizhenneng <lizhenneng@kylinos.cn>
+---
+ debian/changelog                 |  6 ++---
+ debian/kytensor-llm.install      |  1 +
+ debian/rules                     |  2 +-
+ ggml/src/ggml-backend-reg.cpp    |  2 +-
+ ggml/src/ggml-ponn/common.h      |  9 ++++---
+ ggml/src/ggml-ponn/ggml-ponn.cpp | 41 ++++++++++++++++++++++++++++----
+ ggml/src/ggml-ponn/ops.cpp       | 10 ++++----
+ ggml/src/ggml-ponn/ponn.h        |  3 +--
+ ggml/src/gguf.cpp                |  4 ++--
+ src/llama-adapter.cpp            |  3 +++
+ src/llama-model.h                |  2 ++
+ 11 files changed, 60 insertions(+), 23 deletions(-)
+
+diff --git a/debian/changelog b/debian/changelog
+index 6ad34c6..f6f2ce0 100644
+--- a/debian/changelog
++++ b/debian/changelog
+@@ -1,8 +1,8 @@
+-kytensor-llm (2.0.0-ok15k0.4) v11-2603-preview; urgency=medium
++kytensor-llm (2.0.0-ok15k0.5) v11-2603-preview; urgency=medium
+ 
+-  * BUG: #501455 支持RTX4090
++  * BUG: #507905 解决格兰菲卸载模型失败问题
+   * 需求: 无
+-  * 其他改动说明: RTX4090,去除sycl后端依赖runpath,更新copyright,安全检查修复
++  * 其他改动说明: 无
+   * 其他改动影响域: 无
+ 
+  -- liuyihu <liuyihu@kylinos.cn>  Thu, 22 Jan 2026 15:08:34 +0800
+diff --git a/debian/kytensor-llm.install b/debian/kytensor-llm.install
+index a15b287..fcf102a 100644
+--- a/debian/kytensor-llm.install
++++ b/debian/kytensor-llm.install
+@@ -1,4 +1,5 @@
+ usr/lib/*/libggml.so
++usr/lib/*/libggml-ponn.so
+ usr/lib/*/libggml-base.so
+ usr/lib/*/libggml-cpu*.so
+ usr/lib/*/libllama.so
+diff --git a/debian/rules b/debian/rules
+index e6b40f4..55d33bd 100644
+--- a/debian/rules
++++ b/debian/rules
+@@ -55,7 +55,7 @@ override_dh_auto_configure:
+ 		-DGGML_NATIVE=$(BACKEND_NATIVE) \
+ 		-DGGML_AVX512=OFF \
+ 		-DGGML_CPU_ALL_VARIANTS=$(CPU_ALL_VARIANTS) \
+-		-DGGML_PONN=OFF
++		-DGGML_PONN=ON
+ override_dh_auto_build:
+ 	cd build && make -j$(nproc)
+ 
+diff --git a/ggml/src/ggml-backend-reg.cpp b/ggml/src/ggml-backend-reg.cpp
+index f43fbcf..cf853cc 100644
+--- a/ggml/src/ggml-backend-reg.cpp
++++ b/ggml/src/ggml-backend-reg.cpp
+@@ -248,7 +248,7 @@ struct ggml_backend_registry {
+         dl_handle_ptr handle { dl_load_library(path) };
+         if (!handle) {
+             if (!silent) {
+-                GGML_LOG_ERROR("%s: failed to load %s\n", __func__, path_str(path).c_str());
++                GGML_LOG_ERROR("%s: failed to load %s, err info: %s\n", __func__, path_str(path).c_str(), dlerror());
+             }
+             return nullptr;
+         }
+diff --git a/ggml/src/ggml-ponn/common.h b/ggml/src/ggml-ponn/common.h
+index 1733cbe..d79af4c 100644
+--- a/ggml/src/ggml-ponn/common.h
++++ b/ggml/src/ggml-ponn/common.h
+@@ -115,19 +115,18 @@ struct ggml_backend_ponn_context {
+             }
+         }
+         if (one_tensor) {
+-            ponnFreeBuf(one_tensor);
++            ponnFree(one_tensor);
+             one_tensor = nullptr;
+             one_tensor_size = 0;
+         }
+         if (ponn_sin) {
+-            ponnFreeBuf(ponn_sin);
++            ponnFree(ponn_sin);
+             ponn_sin = nullptr;
+         }
+         if (ponn_cos) {
+-            ponnFreeBuf(ponn_cos);
++            ponnFree(ponn_cos);
+             ponn_cos = nullptr;
+         }
+-        ponnDeinit();
+     }
+     /**
+      * @brief Get or create a stream for a given index.
+@@ -175,7 +174,7 @@ struct ggml_backend_ponn_context {
+     PONN_MEM_H get_one_tensor(size_t size, PONN_DATA_TYPE_E ponn_datatype) {
+         if (size > one_tensor_size) {
+             if (one_tensor) {
+-                ponnFreeBuf(one_tensor);
++                ponnFree(one_tensor);
+             }
+             one_tensor = ponnMallocBuf(size);
+             one_tensor_size = size;
+diff --git a/ggml/src/ggml-ponn/ggml-ponn.cpp b/ggml/src/ggml-ponn/ggml-ponn.cpp
+index e4877a1..f789389 100644
+--- a/ggml/src/ggml-ponn/ggml-ponn.cpp
++++ b/ggml/src/ggml-ponn/ggml-ponn.cpp
+@@ -144,7 +144,7 @@ struct ggml_backend_ponn_buffer_context {
+      */
+     ~ggml_backend_ponn_buffer_context() {
+         if (handle) {
+-            ponnFree(handle);
++            ponnDirectFree(handle);
+         }
+     }
+ };
+@@ -195,6 +195,18 @@ static void ggml_backend_ponn_buffer_free_buffer(
+     GGML_PONN_TRACE();
+     ggml_backend_ponn_buffer_context* ctx =
+         (ggml_backend_ponn_buffer_context*)buffer->context;
++    for (auto * extra : ctx->tensor_extras) {
++        if (extra->handle != ctx->handle) {
++            ponnFree(extra->handle);
++            extra->handle = nullptr;
++        }
++        for (auto *extraPonnData : extra->extraPonnData) {
++            ponnFree(extraPonnData);
++        }
++        extra->extraPonnData.clear();
++        delete extra;
++    }
++    ctx->tensor_extras.clear();
+     delete ctx;
+ }
+ 
+@@ -614,8 +626,12 @@ static void ggml_backend_ponn_buffer_clear(
+ static void ggml_backend_ponn_buffer_reset(ggml_backend_buffer_t buffer) {
+     ggml_backend_ponn_buffer_context * ctx = (ggml_backend_ponn_buffer_context *) buffer->context;
+     for (auto * extra : ctx->tensor_extras) {
++        for (auto *extraPonnData : extra->extraPonnData) {
++            ponnFree(extraPonnData);
++        }
++	extra->extraPonnData.clear();
+         if (extra->handle != ctx->handle) {
+-            ponnFreeSubBuf(extra->handle);
++            ponnFree(extra->handle);
+             extra->handle = nullptr;
+         }
+         delete extra;
+@@ -690,7 +706,7 @@ ggml_backend_ponn_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
+ 
+     void* handle = nullptr;
+     void* dev_ptr = nullptr;
+-    handle = ponnMallocBuf(size);
++    handle = ponnDirectMalloc(size);
+     dev_ptr = ponn_ptr_base;
+     if (handle == nullptr) {
+         GGML_LOG_ERROR(
+@@ -726,6 +742,22 @@ static size_t ggml_backend_ponn_buffer_type_get_alignment(
+     GGML_UNUSED(buft);
+ }
+ 
++/**
++ * @brief Retrieves the driver support max allocate size
++ *
++ * This function returns the max gpu memmory size, which ocl driver support
++ *
++ * @param buft Pointer to the buffer type context (unused in this
++ * implementation).
++ * @return The the max gpu memory size in bytes (2G)
++ */
++static size_t ggml_backend_ponn_buffer_get_max_size(ggml_backend_buffer_type_t buft) {
++    GGML_PONN_TRACE();
++    size_t max_allocate_size = ponnGetMaxMemoryAllocateSize();
++    return max_allocate_size;
++    GGML_UNUSED(buft);
++}
++
+ /**
+  * @brief Calculates the allocation size required for a tensor in a PONN buffer.
+  *
+@@ -771,7 +803,7 @@ static ggml_backend_buffer_type_i ggml_backend_ponn_buffer_type_interface = {
+     /* .get_name         = */ ggml_backend_ponn_buffer_type_name,
+     /* .alloc_buffer     = */ ggml_backend_ponn_buffer_type_alloc_buffer,
+     /* .get_alignment    = */ ggml_backend_ponn_buffer_type_get_alignment,
+-    /* .get_max_size     = */ NULL,  // defaults to SIZE_MAX
++    /* .get_max_size     = */ ggml_backend_ponn_buffer_get_max_size,
+     /* .get_alloc_size   = */ ggml_backend_ponn_buffer_type_get_alloc_size,
+     /* .is_host          = */ NULL,
+ };
+@@ -992,6 +1024,7 @@ static void ggml_backend_ponn_free(ggml_backend_t backend) {
+ #endif
+     delete ponn_ctx;
+     delete backend;
++    ponnClearBuffer();
+ }
+ 
+ /**
+diff --git a/ggml/src/ggml-ponn/ops.cpp b/ggml/src/ggml-ponn/ops.cpp
+index 16a1567..a1d5227 100644
+--- a/ggml/src/ggml-ponn/ops.cpp
++++ b/ggml/src/ggml-ponn/ops.cpp
+@@ -542,7 +542,7 @@ void ggml_ponn_soft_max(ggml_backend_ponn_context& ctx, ggml_tensor* dst) {
+     ponnSoftmax(soft_max_input, output, dims);
+ 
+     if (mask_tmp) {
+-        ponnFreeBuf(mask_tmp);
++        ponnFree(mask_tmp);
+     }
+     ponnFinish(src0, input0);
+     ponnFinish(dst, output);
+@@ -704,10 +704,10 @@ static void ggml_ponn_mul_mat_fp(ggml_backend_ponn_context& ctx,
+     }
+ 
+ 
+-    if(w_for_type) ponnFreeBuf(w_for_type);
+-    if(w_for_dims) ponnFreeBuf(w_for_dims);
+-    if(i_for_dims) ponnFreeBuf(i_for_dims);
+-    if(scale_tmp)  ponnFreeBuf(scale_tmp);
++    if(w_for_type) ponnFree(w_for_type);
++    if(w_for_dims) ponnFree(w_for_dims);
++    if(i_for_dims) ponnFree(i_for_dims);
++    if(scale_tmp)  ponnFree(scale_tmp);
+ 
+     ponnFinish(input, input0);
+     ponnFinish(weight, input1);
+diff --git a/ggml/src/ggml-ponn/ponn.h b/ggml/src/ggml-ponn/ponn.h
+index bc5e9a5..3eabe71 100644
+--- a/ggml/src/ggml-ponn/ponn.h
++++ b/ggml/src/ggml-ponn/ponn.h
+@@ -71,10 +71,8 @@ void ponnDestroyEvent(void *event);
+ void ponnMallocBigBuffer(size_t size);
+ void ponnClearBuffer();
+ PONN_MEM_H ponnMallocBuf(size_t size);
+-void ponnFreeBuf(PONN_MEM_H ret);
+ void ponnFree(PONN_MEM_H ret);
+ PONN_MEM_H ponnMallocSubBuf(PONN_MEM_H handle, size_t offset, size_t size);
+-void ponnFreeSubBuf(PONN_MEM_H handle);
+ void * ponnGetBase(PONN_MEM_H handle);
+ void * ponnDirectMalloc(size_t size);
+ void ponnDirectFree(PONN_MEM_H ret);
+@@ -142,6 +140,7 @@ void ponnRope(PONN_MEM_H input, PONN_MEM_H posId, PONN_MEM_H sin,
+                 std::vector<int> &sinDims, std::vector<int> &cosDims,
+                 std::vector<int> &outputDims, const int rotary_dim,
+                 const bool is_neox);
++size_t ponnGetMaxMemoryAllocateSize();
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/gguf.cpp b/ggml/src/gguf.cpp
+index d043ee8..86c3091 100644
+--- a/ggml/src/gguf.cpp
++++ b/ggml/src/gguf.cpp
+@@ -212,8 +212,8 @@ struct gguf_context {
+     size_t alignment = GGUF_DEFAULT_ALIGNMENT;
+     size_t offset    = 0; // offset of `data` from beginning of file
+     size_t size      = 0; // size of `data` in bytes
+-    void * model_addr;      // memory addr for decrypt gguf model
+-    size_t model_size;
++    void * model_addr = nullptr;      // memory addr for decrypt gguf model
++    size_t model_size = 0;
+ 
+     void * data = nullptr;
+ };
+diff --git a/src/llama-adapter.cpp b/src/llama-adapter.cpp
+index c317d4d..3074aa8 100644
+--- a/src/llama-adapter.cpp
++++ b/src/llama-adapter.cpp
+@@ -160,6 +160,9 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
+         throw std::runtime_error("failed to load lora adapter file from " + std::string(path_lora));
+     }
+ 
++    if (decrypt_type != GGUF_DECRYPT_TYPE_NONE)
++        model.decrypt_lora_list.emplace_back(gguf_get_model_addr(ctx_gguf.get()), std::free);
++
+     ggml_context_ptr ctx { ctx_init };
+ 
+     // check metadata
+diff --git a/src/llama-model.h b/src/llama-model.h
+index a9da121..9e676ec 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -340,6 +340,8 @@ struct llama_model {
+ 
+     llama_model_params params;
+ 
++    std::vector<std::unique_ptr<void, decltype(&std::free)>> decrypt_lora_list;
++
+     // gguf metadata
+     std::unordered_map<std::string, std::string> gguf_kv;
+ 
+-- 
+2.43.0
+
