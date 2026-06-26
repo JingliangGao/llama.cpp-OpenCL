@@ -6,6 +6,10 @@
 #include "llama.h"
 #include "chat.h"
 
+#if defined(GGML_UNIFY_PROFILER)
+#include "ggml-profiler.h"    /* add profiler header    JingliangGao 2026/06/25 */
+#endif
+
 #include <clocale>
 #include <cstdio>
 #include <cstring>
@@ -987,6 +991,31 @@ int llama_completion(int argc, char ** argv) {
         LOG_INF("saved final session to %s, n_tokens = %zu\n", path_session.data(), session_tokens.size());
 
     }
+
+#if defined(GGML_UNIFY_PROFILER)
+    /* Export profiling data if profiling was enabled    JingliangGao 2026/06/25 */
+    if (params.profiling) {
+        ggml_backend_sched_t sched = llama_context_get_sched(ctx);
+        if (sched != nullptr) {
+            if (params.profiling_output.empty()) {
+                ggml_backend_sched_print_profiling(sched);
+            } else {
+                const std::string & path = params.profiling_output;
+                int ret;
+                if (path.size() >= 4 && path.compare(path.size() - 4, 4, ".txt") == 0) {
+                    ret = ggml_backend_sched_export_profiling_text(sched, path.c_str());
+                } else {
+                    ret = ggml_backend_sched_export_profiling_json(sched, path.c_str());
+                }
+                if (ret == 0) {
+                    LOG("\nProfiling data exported to: %s\n", path.c_str());
+                } else {
+                    LOG_ERR("\nFailed to export profiling data to: %s\n", path.c_str());
+                }
+            }
+        }
+    }
+#endif
 
     LOG("\n\n");
     common_perf_print(ctx, smpl);

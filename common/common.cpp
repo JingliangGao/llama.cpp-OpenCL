@@ -59,7 +59,11 @@
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
+<<<<<<< Updated upstream
 #if defined(LLAMA_UNIFY_PROFILER)
+=======
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+>>>>>>> Stashed changes
 #include "ggml-profiler.h"     /* insert unify profiler header here     JingliangGao 2026/06/22 */
 #endif
 
@@ -1299,7 +1303,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
-#if defined(LLAMA_UNIFY_PROFILER)
+#if defined(GGML_UNIFY_PROFILER) 
+    /* check profiling params and enable profiling if required     JingliangGao 2026/06/24 */
     if (params.profiling) {
         ggml_backend_sched_t sched = llama_context_get_sched(lctx);
         if (sched != nullptr) {

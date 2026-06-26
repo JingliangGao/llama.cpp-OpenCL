@@ -2652,16 +2652,27 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) 
 }
 
 #if defined(GGML_UNIFY_PROFILER)
-//
-// Scheduler profiling
-//
-
+/* Scheduler profiling    JingliangGao 2026/06/26 */
 void ggml_backend_sched_set_profiling(ggml_backend_sched_t sched, bool enable) {
     GGML_ASSERT(sched);
     sched->profiling_enabled = enable;
 
     if (!enable) {
         ggml_backend_sched_reset_profiling(sched);
+        for (int b = 0; b < sched->n_backends; b++) {
+            ggml_backend_t backend = sched->backends[b];
+            if (backend->profiler != NULL && backend->profiler->enable != NULL) {
+                backend->profiler->enable(backend->profiler->context, false);     /* set profiler unable    JingliangGao 2026/06/26 */
+            }
+        }
+    } else {
+        for (int b = 0; b < sched->n_backends; b++) {
+            ggml_backend_t backend = sched->backends[b];
+            if (backend->profiler != NULL && backend->profiler->enable != NULL) {
+                backend->profiler->enable(backend->profiler->context, true);      /* set profiler enable    JingliangGao 2026/06/26 */
+            }
+        }
+
     }
 }
 

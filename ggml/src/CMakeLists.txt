@@ -245,6 +245,11 @@ if (GGML_OPENMP_ENABLED)
     target_link_libraries(ggml-base PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
 endif()
 
+# JingliangGao 2026/06/24
+if (GGML_UNIFY_PROFILER)
+    target_compile_definitions(ggml-base PUBLIC GGML_UNIFY_PROFILER)
+endif()
+
 add_library(ggml
             ggml-backend-dl.cpp
             ggml-backend-reg.cpp)

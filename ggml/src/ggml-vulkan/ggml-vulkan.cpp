@@ -1,4 +1,7 @@
 #include "ggml-vulkan.h"
+#if defined(GGML_UNIFY_PROFILER)
+#include "ggml-profiler.h"    /* add profiler header    JingliangGao 2026/06/25 */
+#endif
 #include <vulkan/vulkan_core.h>
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
@@ -2011,6 +2014,23 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+#if defined(GGML_UNIFY_PROFILER)
+/* Profiler state for the ggml_backend_profiler interface    JingliangGao 2026/06/25 */
+struct ggml_vk_profiler_state {
+    bool enabled = false;
+    int  split_id = -1;
+
+    std::vector<ggml_profile_record> records;
+    std::vector<uint64_t>            cpu_timestamps;
+
+    void reset() {
+        records.clear();
+        cpu_timestamps.clear();
+        split_id = -1;
+    }
+};
+#endif
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -2073,6 +2093,9 @@ struct ggml_backend_vk_context {
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
+#if defined(GGML_UNIFY_PROFILER)
+    ggml_vk_profiler_state * profiler_state = nullptr;    /* JingliangGao 2026/06/25 */
+#endif
     vk::QueryPool query_pool;
     std::vector<const char *> query_fusion_names;
     std::vector<int> query_fusion_node_count;
@@ -14194,11 +14217,23 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             ctx->unsynced_nodes_read.clear();
             ggml_vk_sync_buffers(ctx, compute_ctx);
 
+#if defined(GGML_UNIFY_PROFILER)
+            if ((vk_perf_logger_enabled || (ctx->profiler_state != nullptr && ctx->profiler_state->enabled))    /* JingliangGao 2026/06/25 */
+                    && vk_perf_logger_concurrent) {
+                ctx->query_node_idx[ctx->query_idx] = node_idx;
+                compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
+                ggml_vk_sync_buffers(ctx, compute_ctx);
+                if (ctx->profiler_state != nullptr && ctx->profiler_state->enabled) {
+                    ctx->profiler_state->cpu_timestamps.push_back(ggml_profiler_time_ns());
+                }
+            }
+#else
             if (vk_perf_logger_enabled && vk_perf_logger_concurrent) {
                 ctx->query_node_idx[ctx->query_idx] = node_idx;
                 compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
                 ggml_vk_sync_buffers(ctx, compute_ctx);
             }
+#endif
         }
         // Add all fused nodes to the unsynchronized lists.
         for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
@@ -15855,7 +15890,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ggml_vk_submit_transfer_ctx(ctx);
 
     vk_context compute_ctx;
-    if (vk_perf_logger_enabled) {
+#if defined(GGML_UNIFY_PROFILER)
+    /* Check if profiler is enabled    JingliangGao 2026/06/25 */
+    bool profiling = vk_perf_logger_enabled ||
+                     (ctx->profiler_state != nullptr && ctx->profiler_state->enabled);
+#else
+    bool profiling = vk_perf_logger_enabled;
+#endif
+    if (profiling) {
         // allocate/resize the query pool
         if (ctx->num_queries < cgraph->n_nodes + 1) {
             if (ctx->query_pool) {
@@ -15883,6 +15925,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->query_idx = 0;
         compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
         ggml_vk_sync_buffers(ctx, compute_ctx);
+#if defined(GGML_UNIFY_PROFILER)
+        /* Initialize CPU timestamps for profiler    JingliangGao 2026/06/25 */
+        if (ctx->profiler_state != nullptr && ctx->profiler_state->enabled) {
+            ctx->profiler_state->cpu_timestamps.clear();
+            ctx->profiler_state->cpu_timestamps.push_back(ggml_profiler_time_ns());
+        }
+#endif
     }
 
     ctx->prealloc_y_last_pipeline_used = nullptr;
@@ -16134,7 +16183,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 
+#if defined(GGML_UNIFY_PROFILER)
+        /* Check profiler_state for unified profiler    JingliangGao 2026/06/25 */
+        if ((vk_perf_logger_enabled || (ctx->profiler_state != nullptr && ctx->profiler_state->enabled)) && enqueued) {
+#else
         if (vk_perf_logger_enabled && enqueued) {
+#endif
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
             if (!vk_perf_logger_concurrent) {
                 // track a single node/fusion for the current query
@@ -16142,6 +16196,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->query_fusion_names[ctx->query_idx] = fusion_string;
                 compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
                 ggml_vk_sync_buffers(ctx, compute_ctx);
+#if defined(GGML_UNIFY_PROFILER)
+                if (ctx->profiler_state != nullptr && ctx->profiler_state->enabled) {
+                    ctx->profiler_state->cpu_timestamps.push_back(ggml_profiler_time_ns());
+                }
+#endif
             } else {
                 // track a fusion string and number of fused ops for the current node_idx
                 ctx->query_fusion_names[i] = fusion_string;
@@ -16175,7 +16234,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     ctx->last_total_mul_mat_bytes = total_mul_mat_bytes;
 
+#if defined(GGML_UNIFY_PROFILER)
+    /* Check if profiling or unified profiler is active    JingliangGao 2026/06/25 */
+    if (profiling) {
+#else
     if (vk_perf_logger_enabled) {
+#endif
         // End the command buffer and submit/wait
         GGML_ASSERT(!ctx->compute_ctx.expired());
         compute_ctx = ctx->compute_ctx.lock();
@@ -16189,12 +16253,42 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // Get the results and pass them to the logger
         std::vector<uint64_t> timestamps(cgraph->n_nodes + 1);
         VK_CHECK(ctx->device->device.getQueryPoolResults(ctx->query_pool, 0, ctx->query_idx, (cgraph->n_nodes + 1)*sizeof(uint64_t), timestamps.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait), "get timestamp results");
+
+#if defined(GGML_UNIFY_PROFILER)
+        const double ts_period = ctx->device->properties.limits.timestampPeriod;
+        const bool has_profiler = ctx->profiler_state != nullptr && ctx->profiler_state->enabled;
+#endif
+
         if (!vk_perf_logger_concurrent) {
             // Log each op separately
             for (int i = 1; i < ctx->query_idx; i++) {
                 auto node = ctx->query_nodes[i];
                 auto name = ctx->query_fusion_names[i];
-                ctx->perf_logger->log_timing(node, name, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
+                uint64_t duration_ns = uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod);
+
+                if (ctx->perf_logger) {
+                    ctx->perf_logger->log_timing(node, name, duration_ns);
+                }
+
+#if defined(GGML_UNIFY_PROFILER)
+                /* Record profiling data for unified profiler    JingliangGao 2026/06/25 */
+                if (has_profiler && node != nullptr) {
+                    uint64_t cpu_ts = (i < (int)ctx->profiler_state->cpu_timestamps.size())
+                                    ? ctx->profiler_state->cpu_timestamps[i] : 0;
+
+                    ggml_profile_record rec;
+                    rec.type       = GGML_PROFILE_EVENT_OP;
+                    rec.name       = ggml_op_name(node->op);
+                    rec.backend_id = -1;
+                    rec.split_id   = ctx->profiler_state->split_id;
+                    rec.start_ns   = cpu_ts;
+                    rec.end_ns     = cpu_ts + duration_ns;
+                    rec.bytes      = ggml_nbytes(node);
+                    rec.extra      = name;
+                    ggml_profile_record_from_tensor(&rec, node);
+                    ctx->profiler_state->records.push_back(rec);
+                }
+#endif
             }
         } else {
             // Log each group of nodes
@@ -16212,10 +16306,42 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     node_idx += ctx->query_fusion_node_count[node_idx];
                 }
                 prev_node_idx = cur_node_idx;
-                ctx->perf_logger->log_timing(nodes, names, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
+                uint64_t duration_ns = uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod);
+
+                if (ctx->perf_logger) {
+                    ctx->perf_logger->log_timing(nodes, names, duration_ns);
+                }
+
+#if defined(GGML_UNIFY_PROFILER)
+                /* Record profiling data for unified profiler (concurrent mode)    JingliangGao 2026/06/25 */
+                if (has_profiler && !nodes.empty()) {
+                    uint64_t cpu_ts = (i < (int)ctx->profiler_state->cpu_timestamps.size())
+                                    ? ctx->profiler_state->cpu_timestamps[i] : 0;
+                    auto * node = nodes[0];
+
+                    uint64_t total_bytes = 0;
+                    for (size_t j = 0; j < nodes.size(); j++) {
+                        total_bytes += ggml_nbytes(nodes[j]);
+                    }
+
+                    ggml_profile_record rec;
+                    rec.type       = GGML_PROFILE_EVENT_OP;
+                    rec.name       = ggml_op_name(node->op);
+                    rec.backend_id = -1;
+                    rec.split_id   = ctx->profiler_state->split_id;
+                    rec.start_ns   = cpu_ts;
+                    rec.end_ns     = cpu_ts + duration_ns;
+                    rec.bytes      = total_bytes;
+                    rec.extra      = names[0];
+                    ggml_profile_record_from_tensor(&rec, node);
+                    ctx->profiler_state->records.push_back(rec);
+                }
+#endif
             }
         }
-        ctx->perf_logger->print_timings();
+        if (ctx->perf_logger) {
+            ctx->perf_logger->print_timings();
+        }
     }
 
     if (!ctx->device->support_async) {
@@ -16572,11 +16698,68 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
         /* .iface   = */ ggml_backend_vk_interface,
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), dev_num),
         /* .context = */ ctx,
+#if defined(GGML_UNIFY_PROFILER)
+        /* .profiler = */ nullptr,    /* JingliangGao 2026/06/25 */
+#endif
     };
 
     if (!ctx->device->support_async) {
         vk_backend->iface.get_tensor_async = nullptr;
     }
+
+#if defined(GGML_UNIFY_PROFILER)
+    /* Register profiler for Vulkan backend    JingliangGao 2026/06/25 */
+    auto * prof_state = new ggml_vk_profiler_state();
+    ctx->profiler_state = prof_state;
+
+    static auto vk_prof_enable = [](void * context, bool enable) {
+        auto * vk_ctx = (ggml_backend_vk_context *)context;
+        if (vk_ctx->profiler_state != nullptr) {
+            vk_ctx->profiler_state->enabled = enable;
+            if (!enable) {
+                vk_ctx->profiler_state->reset();
+            }
+        }
+    };
+    static auto vk_prof_reset = [](void * context) {
+        auto * vk_ctx = (ggml_backend_vk_context *)context;
+        if (vk_ctx->profiler_state != nullptr) {
+            vk_ctx->profiler_state->reset();
+        }
+    };
+    static auto vk_prof_set_split_id = [](void * context, int split_id) {
+        auto * vk_ctx = (ggml_backend_vk_context *)context;
+        if (vk_ctx->profiler_state != nullptr) {
+            vk_ctx->profiler_state->split_id = split_id;
+        }
+    };
+    static auto vk_prof_get_records = [](void * context, const ggml_profile_record ** out) -> int {
+        auto * vk_ctx = (ggml_backend_vk_context *)context;
+        if (vk_ctx->profiler_state != nullptr) {
+            *out = vk_ctx->profiler_state->records.data();
+            return (int)vk_ctx->profiler_state->records.size();
+        }
+        *out = nullptr;
+        return 0;
+    };
+    static auto vk_prof_free = [](void * context) {
+        auto * vk_ctx = (ggml_backend_vk_context *)context;
+        if (vk_ctx->profiler_state != nullptr) {
+            delete vk_ctx->profiler_state;
+            vk_ctx->profiler_state = nullptr;
+        }
+    };
+
+    auto * profiler = new ggml_backend_profiler {
+        /* .context      = */ ctx,
+        /* .enable       = */ vk_prof_enable,
+        /* .reset        = */ vk_prof_reset,
+        /* .set_split_id = */ vk_prof_set_split_id,
+        /* .get_records  = */ vk_prof_get_records,
+        /* .free_context = */ vk_prof_free,
+    };
+    ggml_backend_set_profiler(vk_backend, profiler);
+#endif
 
     return vk_backend;
 }

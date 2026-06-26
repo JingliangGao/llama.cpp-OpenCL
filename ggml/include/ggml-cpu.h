@@ -23,7 +23,8 @@ extern "C" {
         // use only reference implementations
         bool use_ref;
 
-#if defined(LLAMA_UNIFY_PROFILER)
+#if defined(GGML_UNIFY_PROFILER)
+        /* add ggml_cplan params    JingliangGao 2026/06/24 */
         // profiler context (set by backend when profiling is enabled, NULL otherwise)
         // when non-NULL, the compute loop will record per-node timing
         void * profiling_context;
@@ -40,8 +41,9 @@ extern "C" {
                                     uint64_t                   end_ns,
                                     uint64_t                   bytes,
                                     const char *               extra,
-                                    const struct ggml_tensor * node);// unify profiler params
+                                    const struct ggml_tensor * node);
 #endif
+
     };
 
     // numa strategies

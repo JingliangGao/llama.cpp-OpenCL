@@ -18,6 +18,10 @@
 #include <limits>
 #include <stdexcept>
 
+#if defined(GGML_UNIFY_PROFILER)
+#include "ggml-profiler.h"    /* add profiler header    JingliangGao 2026/06/25 */
+#endif
+
 //
 // llama_context
 //
@@ -2438,6 +2442,13 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
+#if defined(GGML_UNIFY_PROFILER)
+    /* If profiling is enabled, synchronize to ensure records are complete    JingliangGao 2026/06/25 */
+    if (ggml_backend_sched_get_profiling(sched.get())) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+#endif
+
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
@@ -3706,6 +3717,16 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
 
     return ctx->get_memory();
 }
+
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+ggml_backend_sched_t llama_context_get_sched(const struct llama_context * ctx) {
+    if (!ctx) {
+        return nullptr;
+    }
+
+    return ctx->get_sched();
+}
+#endif
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();

@@ -28,8 +28,8 @@
 #define die(msg)          do { fputs("error: " msg "\n", stderr);                exit(1); } while (0)
 #define die_fmt(fmt, ...) do { fprintf(stderr, "error: " fmt "\n", __VA_ARGS__); exit(1); } while (0)
 
-#if defined(LLAMA_UNIFY_PROFILER)
-#include "ggml-profiler.h"    /* insert unify profiler header here     JingliangGao 2026/06/22 */
+#if defined(GGML_UNIFY_PROFILER)
+#include "ggml-profiler.h"    /* insert unify profiler header     JingliangGao 2026/06/22 */
 #endif
 
 struct common_time_meas {
@@ -713,7 +713,11 @@ struct common_params {
     void *                  load_progress_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
 
+<<<<<<< Updated upstream
 #if defined(LLAMA_UNIFY_PROFILER)
+=======
+#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
+>>>>>>> Stashed changes
     /* insert unify profiler params here     JingliangGao 2026/06/22 */
     // unify profiler params
     bool        with_backends    = false;  // export graph ops with backend assignments

@@ -3,12 +3,12 @@
 # set variables
 PROJECT_DIR=$(pwd)
 BACKEND="cpu"
-GGUF_MODEL="<path-to-gguf-model>"
+BUILD_FOLDER="build_${BACKEND}_profiler"
+
 
 # refresh build folder
 echo "[INFO] Refreshing build folder..."
 cd ${PROJECT_DIR}
-BUILD_FOLDER="build_${BACKEND}"
 if [ -d ${BUILD_FOLDER} ]; then
     rm -rf ${BUILD_FOLDER}
 fi

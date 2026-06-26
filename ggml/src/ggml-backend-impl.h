@@ -147,16 +147,16 @@ extern "C" {
         struct ggml_backend_i iface;
         ggml_backend_dev_t device;
         void * context;
-    };
-
-    struct ggml_backend_event {
-        struct ggml_backend_device * device;
-        void * context;
 
 #if defined(GGML_UNIFY_PROFILER)
         ggml_backend_profiler_t profiler;    /* Optional profiler (set by backend during init, NULL if not profiling)     JingliangGao 2026/06/22 */
 #endif
 
+    };
+
+    struct ggml_backend_event {
+        struct ggml_backend_device * device;
+        void * context;
     };
 
     //

@@ -8,10 +8,11 @@
 #include "ggml-impl.h"
 #include "quants.h"
 #include "ggml-threading.h"
-#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
-#include "ggml-profiler.h"
-#include <time.h>
+
+#if defined(GGML_UNIFY_PROFILER) 
+#include "ggml-profiler.h"    /* add profiler header   JingliangGao 2026/06/24 */
 #endif
+
 #include "unary-ops.h"
 #include "binary-ops.h"
 #include "vec.h"
@@ -1173,8 +1174,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
-    enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+    const ggml_vec_dot_t  vec_dot      = type_traits_cpu[type].vec_dot;
+    const enum ggml_type  vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
@@ -3047,18 +3048,27 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
-    for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
-        struct ggml_tensor * node = cgraph->nodes[node_n];
+#ifdef GGML_UNIFY_PROFILER
+    /* Profiling state    JingliangGao 2026/06/24 */
+    if (cplan->profiling_context != NULL && cplan->profiling_record_fn != NULL) {
+        for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
+            struct ggml_tensor * node = cgraph->nodes[node_n];
 
-        if (ggml_op_is_empty(node->op)) {
-            // skip NOPs
-            continue;
-        }
+            if (ggml_op_is_empty(node->op)) {
+                continue;
+            }
 
-        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-            continue;
-        }
+            if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                continue;
+            }
 
+            // Only thread 0 records timing (after barrier = total node time)
+            uint64_t t_start = 0;
+            if (state->ith == 0) {
+                t_start = ggml_profiler_time_ns();
+            }
+
+<<<<<<< Updated upstream
 #if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
         // Per-node profiling: record timing on thread 0 only
         uint64_t prof_start_ns = 0;
@@ -3075,9 +3085,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (n_fused > 0) {
             node_n += n_fused;
         } else {
+=======
+>>>>>>> Stashed changes
             ggml_compute_forward(&params, node);
-        }
 
+<<<<<<< Updated upstream
 #if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
         if (state->ith == 0 && cplan->profiling_record_fn) {
             struct timespec ts;
@@ -3102,12 +3114,61 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 cplan->abort_callback(cplan->abort_callback_data)) {
             atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
             tp->ec    = GGML_STATUS_ABORTED;
-        }
+=======
+            if (node_n + 1 < cgraph->n_nodes) {
+                ggml_barrier(state->threadpool);
+            }
 
-        if (node_n + 1 < cgraph->n_nodes) {
-            ggml_barrier(state->threadpool);
+            if (state->ith == 0) {
+                uint64_t t_end = ggml_profiler_time_ns();
+                cplan->profiling_record_fn(cplan->profiling_context, 0 /* GGML_PROFILE_EVENT_OP */,
+                                           ggml_op_name(node->op), -1, t_start, t_end, ggml_nbytes(node), NULL,
+                                           node);
+            }
+
+            if (state->ith == 0 && cplan->abort_callback && cplan->abort_callback(cplan->abort_callback_data)) {
+                atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
+                tp->ec = GGML_STATUS_ABORTED;
+            }
+>>>>>>> Stashed changes
         }
+    } else {
+#endif
+        for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
+            struct ggml_tensor * node = cgraph->nodes[node_n];
+
+            if (ggml_op_is_empty(node->op)) {
+                // skip NOPs
+                continue;
+            }
+
+            if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                continue;
+            }
+
+            // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+            // Try fused ops, fall back to normal compute
+            const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+            if (n_fused > 0) {
+                node_n += n_fused;
+            } else {
+                ggml_compute_forward(&params, node);
+            }
+
+            if (state->ith == 0 && cplan->abort_callback &&
+                    cplan->abort_callback(cplan->abort_callback_data)) {
+                atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
+                tp->ec    = GGML_STATUS_ABORTED;
+            }
+
+            if (node_n + 1 < cgraph->n_nodes) {
+                ggml_barrier(state->threadpool);
+            }
+        }
+#if defined(GGML_UNIFY_PROFILER)
     }
+#endif
+
 
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p\n", state->ith, (const void *)cplan);

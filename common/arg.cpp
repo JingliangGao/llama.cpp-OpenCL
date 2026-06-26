@@ -4123,7 +4123,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
 
-#ifdef LLAMA_USE_PROFILER
+#if defined(GGML_UNIFY_PROFILER)
     /* add profiling args    JingliangGao 2026/06/22 */
     add_opt(common_arg(
         {"--profile"},
