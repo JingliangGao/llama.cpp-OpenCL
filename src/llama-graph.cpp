@@ -21,6 +21,109 @@
 
 // dedup helpers
 
+struct ggml_k_nearst_compress_params {
+    int64_t n_expert_used;
+    int64_t n_expert_active;
+    int32_t k;
+};
+
+static void ggml_k_nearst_compress_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    (void) ith;
+    (void) nth;
+
+    const auto * params = (const ggml_k_nearst_compress_params *) userdata;
+    const int64_t n_expert_used = params->n_expert_used;
+    const int64_t n_expert_active = params->n_expert_active;
+    const int32_t k = params->k;
+
+    ggml_tensor ** args = (ggml_tensor **) dst->src[0];
+    const int32_t * selected_experts = (const int32_t *) args[0]->data;
+    const float * weights = (const float *) args[1]->data;
+    float * dst_weights = (float *) dst->data;
+
+    const int64_t n_tokens = args[0]->ne[1];
+
+    for (int64_t t = 0; t < n_tokens; t++) {
+        std::vector<std::pair<int32_t, float>> expert_weight_pairs;
+        expert_weight_pairs.reserve(n_expert_used);
+
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            expert_weight_pairs.emplace_back(selected_experts[e * n_tokens + t], weights[e * n_tokens + t]);
+        }
+
+        std::sort(expert_weight_pairs.begin(), expert_weight_pairs.end(),
+            [](const std::pair<int32_t, float> & a, const std::pair<int32_t, float> & b) {
+                return a.second > b.second;
+            });
+
+        std::vector<float> new_weights(n_expert_active, 0.0f);
+
+        for (int64_t i = 0; i < n_expert_active; i++) {
+            new_weights[i] = expert_weight_pairs[i].second;
+        }
+
+        for (int64_t i = n_expert_active; i < n_expert_used; i++) {
+            const int32_t dropped_expert = expert_weight_pairs[i].first;
+            const float dropped_weight = expert_weight_pairs[i].second;
+
+            std::vector<std::pair<int32_t, float>> distances;
+            for (int64_t j = 0; j < n_expert_active; j++) {
+                const int32_t dist = std::abs(expert_weight_pairs[j].first - dropped_expert);
+                distances.emplace_back(j, (float) dist);
+            }
+
+            std::sort(distances.begin(), distances.end(),
+                [](const std::pair<int32_t, float> & a, const std::pair<int32_t, float> & b) {
+                    return a.second < b.second;
+                });
+
+            float total_dist = 0.0f;
+            const int32_t k_eff = std::min(k, (int32_t) n_expert_active);
+            for (int32_t j = 0; j < k_eff; j++) {
+                total_dist += 1.0f / (distances[j].second + 1.0f);
+            }
+
+            for (int32_t j = 0; j < k_eff; j++) {
+                const float ratio = (1.0f / (distances[j].second + 1.0f)) / total_dist;
+                new_weights[distances[j].first] += dropped_weight * ratio;
+            }
+        }
+
+        for (int64_t i = 0; i < n_expert_active; i++) {
+            dst_weights[i * n_tokens + t] = new_weights[i];
+        }
+    }
+}
+
+static ggml_tensor * ggml_k_nearst_compress(
+        struct ggml_context * ctx,
+        ggml_tensor * selected_experts,
+        ggml_tensor * weights,
+        int64_t n_expert_used,
+        int64_t n_expert_active,
+        int32_t k,
+        int64_t n_tokens,
+        bool apply_k_nearst=false) {
+    if (!apply_k_nearst) {
+        weights = ggml_view_3d(ctx, weights, 1, n_expert_active, n_tokens, weights->nb[1], weights->nb[2], 0);
+        weights = ggml_cont(ctx, weights);
+        return weights;
+    }
+
+    ggml_tensor * weights_2d = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
+
+    ggml_tensor * args[] = { selected_experts, weights_2d };
+
+    ggml_k_nearst_compress_params params;
+    params.n_expert_used = n_expert_used;
+    params.n_expert_active = n_expert_active;
+    params.k = k;
+
+    ggml_tensor * result = ggml_custom_4d(ctx, GGML_TYPE_F32, n_expert_active, n_tokens, 1, 1, args, 2, ggml_k_nearst_compress_op, 1, &params);
+
+    return ggml_reshape_3d(ctx, result, 1, n_expert_active, n_tokens);
+}
+
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
@@ -1628,17 +1731,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (cparams.n_expert_override < n_expert_used && cparams.n_expert_override > 0 ) {
         n_expert_active = n_expert_used - cparams.n_expert_override;
 
-        /* transform [n_expert_used, n_tokens] to [n_expert_active, n_tokens] */
+        ggml_tensor * selected_experts_full = selected_experts;
+
         selected_experts = ggml_view_2d(ctx0, selected_experts, n_expert_active, n_tokens, selected_experts->nb[1], 0);
-        /* experts must be contiguous */
         selected_experts = ggml_cont(ctx0, selected_experts);
         cb(selected_experts, "ffn_moe_topk_sliced", il);
 
-        /* transform [1, n_expert_used, n_tokens] to [1, n_expert_active, n_tokens] */
-        weights = ggml_view_3d(ctx0, weights, 1, n_expert_active, n_tokens, weights->nb[1], weights->nb[2], 0);
-        /* experts must be contiguous */
-        weights = ggml_cont(ctx0, weights);
-        cb(weights, "ffn_moe_weights_sliced", il);
+        /* compress weights */
+        weights = ggml_k_nearst_compress(ctx0, selected_experts_full, weights, n_expert_used, n_expert_active, 1, n_tokens);
+        cb(weights, "ffn_moe_weights_knearst", il);
+
     }
 
     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
