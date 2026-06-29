@@ -9,6 +9,9 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
+#ifdef GGML_KYLIN_SUPPORT                                                                                   // JingliangGao 2026/06/27
+#include "model-split.h"                                                                                      // JingliangGao 2026/06/27
+#endif                                                                                                      // JingliangGao 2026/06/27
 
 #include <algorithm>
 #include <cinttypes>
@@ -1256,6 +1259,10 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+#ifdef GGML_KYLIN_SUPPORT                                                                                   // JingliangGao 2026/06/27
+    // Apply auto-split configuration if enabled                                                                          // JingliangGao 2026/06/27
+    common_model_auto_split_apply(params);                                                                     // JingliangGao 2026/06/27
+#endif                                                                                                      // JingliangGao 2026/06/27
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 

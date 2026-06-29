@@ -9,6 +9,9 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "preset.h"
+#ifdef GGML_KYLIN_SUPPORT                                                                                   // JingliangGao 2026/06/27
+#include "model-split.h"                                                                                      // JingliangGao 2026/06/27
+#endif                                                                                                      // JingliangGao 2026/06/27
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -2585,6 +2588,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.check_tensors = true;
         }
     ));
+#ifdef GGML_KYLIN_SUPPORT                                                                                   // JingliangGao 2026/06/27
+    add_opt(common_arg(                                                                                     // JingliangGao 2026/06/27
+        {"--auto-split"}, "[CONFIG]",                                                                        // JingliangGao 2026/06/27
+        "automatically split model across GPUs based on file size and VRAM budget (default: disabled)\n"       // JingliangGao 2026/06/27
+        "CONFIG format: on[,vram=N][,ratio=N][,max_layers=N]\n"                                              // JingliangGao 2026/06/27
+        "  - vram: VRAM budget (e.g., 8G, 16G, 0 = auto-detect)\n"                                         // JingliangGao 2026/06/27
+        "  - ratio: target VRAM usage ratio (0.0-1.0, default: 0.85)\n"                                     // JingliangGao 2026/06/27
+        "  - max_layers: maximum number of layers to offload (0 = unlimited)\n"                              // JingliangGao 2026/06/27
+        "examples: --auto-split on, --auto-split on,vram=8G, --auto-split on,ratio=0.9,max_layers=50",       // JingliangGao 2026/06/27
+        [](common_params & params, const std::string & value) {                                              // JingliangGao 2026/06/27
+            struct common_model_split_config config;                                                           // JingliangGao 2026/06/27
+            if (!common_model_split_parse_config(value, config)) {                                             // JingliangGao 2026/06/27
+                throw std::invalid_argument(string_format("invalid auto-split config: %s", value.c_str()));     // JingliangGao 2026/06/27
+            }                                                                                                 // JingliangGao 2026/06/27
+            common_model_split_set_config(config);                                                            // JingliangGao 2026/06/27
+        }                                                                                                    // JingliangGao 2026/06/27
+    ).set_env("LLAMA_ARG_AUTO_SPLIT"));                                                                     // JingliangGao 2026/06/27
+#endif                                                                                                      // JingliangGao 2026/06/27
     add_opt(common_arg(
         {"--override-kv"}, "KEY=TYPE:VALUE,...",
         "advanced option to override model metadata by key. to specify multiple overrides, either use comma-separated values.\n"
@@ -3215,6 +3236,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.use_jinja = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_JINJA"));
+    add_opt(common_arg(                                                                                     // JingliangGao 2026/06/27
+        {"--chat-template-kwargs"}, "JSON",                                                                  // JingliangGao 2026/06/27
+        "extra JSON object passed into the chat template context (default: none)\n"                          // JingliangGao 2026/06/27
+        "example: --chat-template-kwargs '{\"enable_thinking\":false}'",                                     // JingliangGao 2026/06/27
+        [](common_params & params, const std::string & value) {                                              // JingliangGao 2026/06/27
+            auto j = json::parse(value);                                                                     // JingliangGao 2026/06/27
+            if (!j.is_object()) {                                                                           // JingliangGao 2026/06/27
+                throw std::invalid_argument("expected a JSON object");                                      // JingliangGao 2026/06/27
+            }                                                                                               // JingliangGao 2026/06/27
+            params.chat_template_kwargs = j.dump();                                                         // JingliangGao 2026/06/27
+        }                                                                                                   // JingliangGao 2026/06/27
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CHAT_TEMPLATE_KWARGS"));   // JingliangGao 2026/06/27
     add_opt(common_arg(
         {"--reasoning-format"}, "FORMAT",
         "controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:\n"
@@ -3233,11 +3266,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (is_truthy(value)) {
                 params.enable_reasoning = 1;
                 params.default_template_kwargs["enable_thinking"] = "true";
+                params.reasoning = "on";                                                                   // JingliangGao 2026/06/27
+                json j = params.chat_template_kwargs.empty() ? json::object() : json::parse(params.chat_template_kwargs); // JingliangGao 2026/06/27
+                if (!j.is_object()) {                                                                      // JingliangGao 2026/06/27
+                    throw std::invalid_argument("chat_template_kwargs must be a JSON object");              // JingliangGao 2026/06/27
+                }                                                                                          // JingliangGao 2026/06/27
+                j["enable_thinking"] = true;                                                               // JingliangGao 2026/06/27
+                params.chat_template_kwargs = j.dump();                                                     // JingliangGao 2026/06/27
             } else if (is_falsey(value)) {
                 params.enable_reasoning = 0;
                 params.default_template_kwargs["enable_thinking"] = "false";
+                params.reasoning = "off";                                                                  // JingliangGao 2026/06/27
+                json j = params.chat_template_kwargs.empty() ? json::object() : json::parse(params.chat_template_kwargs); // JingliangGao 2026/06/27
+                if (!j.is_object()) {                                                                      // JingliangGao 2026/06/27
+                    throw std::invalid_argument("chat_template_kwargs must be a JSON object");              // JingliangGao 2026/06/27
+                }                                                                                          // JingliangGao 2026/06/27
+                j["enable_thinking"] = false;                                                              // JingliangGao 2026/06/27
+                params.chat_template_kwargs = j.dump();                                                     // JingliangGao 2026/06/27
+                params.reasoning_budget = 0;                                                               // JingliangGao 2026/06/27 - token-level suppression
             } else if (is_autoy(value)) {
                 params.enable_reasoning = -1;
+                params.reasoning = "auto";                                                                 // JingliangGao 2026/06/27
             } else {
                 throw std::invalid_argument(
                     string_format("error: unknown value for --reasoning: '%s'\n", value.c_str()));

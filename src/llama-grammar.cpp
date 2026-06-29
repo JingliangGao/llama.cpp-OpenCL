@@ -1448,8 +1448,9 @@ void llama_grammar_accept_str(struct llama_grammar & grammar, const std::string 
     }
 
     grammar.partial_utf8 = decoded.second;
-    if (grammar.stacks.empty()) {
-        throw std::runtime_error("Unexpected empty grammar stack after accepting piece: " + piece);
+    if (grammar.stacks.empty()) {                                                                         // JingliangGao 2026/06/27
+        LLAMA_LOG_ERROR("Unexpected empty grammar stack after accepting piece: '%s' (forcing terminal grammar state)", piece.c_str()); // JingliangGao 2026/06/27
+        grammar.stacks = llama_grammar_stacks{ llama_grammar_stack{} };                                    // JingliangGao 2026/06/27
     }
 }
 

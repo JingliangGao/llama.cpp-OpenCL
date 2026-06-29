@@ -623,8 +623,13 @@ struct common_params {
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
+    // JSON object string, passed to Minja as extra template context (e.g. {"enable_thinking":false})
+    std::string chat_template_kwargs = "";                                                                  // NOLINT JingliangGao 2026/06/27
     bool use_jinja = true;                                                                                  // NOLINT
     bool enable_chat_template = true;
+    // dynamic reasoning switch (affects both template kwargs and reasoning budget defaults)
+    // "auto" leaves model/template defaults; "on"/"off" forces enable_thinking
+    std::string reasoning = "auto";                                                                         // NOLINT JingliangGao 2026/06/27
     bool force_pure_content_parser = false;
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable

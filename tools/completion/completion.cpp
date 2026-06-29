@@ -339,10 +339,20 @@ int llama_completion(int argc, char ** argv) {
     }
 
     // Tokenize negative prompt
+#ifdef GGML_KYLIN_SUPPORT                                                                                   // JingliangGao 2026/06/27
+    // Support long prompts by truncating instead of exiting (matches generation loop behavior)            // JingliangGao 2026/06/27
+    if ((int) embd_inp.size() > n_ctx - 4) {                                                               // JingliangGao 2026/06/27
+        const int skipped_tokens = (int) embd_inp.size() - (n_ctx - 4);                                     // JingliangGao 2026/06/27
+        embd_inp.resize(n_ctx - 4);                                                                         // JingliangGao 2026/06/27
+        LOG_WRN("%s: prompt too long, truncated %d token%s (%d tokens max)\n",                              // JingliangGao 2026/06/27
+                __func__, skipped_tokens, skipped_tokens != 1 ? "s" : "", n_ctx - 4);                       // JingliangGao 2026/06/27
+    }                                                                                                       // JingliangGao 2026/06/27
+#else                                                                                                       // JingliangGao 2026/06/27
     if ((int) embd_inp.size() > n_ctx - 4) {
         LOG_ERR("%s: prompt is too long (%d tokens, max %d)\n", __func__, (int) embd_inp.size(), n_ctx - 4);
         return 1;
     }
+#endif                                                                                                      // JingliangGao 2026/06/27
 
     bool session_do_save = false;
 

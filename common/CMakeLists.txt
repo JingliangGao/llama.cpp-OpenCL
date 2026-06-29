@@ -96,6 +96,8 @@ add_library(${TARGET}
     llguidance.cpp
     log.cpp
     log.h
+    model-split.cpp
+    model-split.h
     ngram-cache.cpp
     ngram-cache.h
     ngram-map.cpp

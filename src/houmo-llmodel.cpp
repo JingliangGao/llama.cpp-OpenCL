@@ -8,6 +8,9 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#ifndef _WIN32                                                                                              // JingliangGao 2026/06/27
+#include <unistd.h>                                                                                         // JingliangGao 2026/06/27
+#endif                                                                                                      // JingliangGao 2026/06/27
 #ifdef ENABLE_HOUMO_DADAO
 #include "tcim_c_api_loader.h"
 #include "houmo-embedding-layer.h"
@@ -20,12 +23,18 @@ static bool g_tcim_loaded = false;
 static bool load_tcim_library() {
     if (g_tcim_loaded) return true;
 
-    const char* lib_path = std::getenv("TCIM_LIBRARY_PATH");
-    if (!lib_path) {
+    const char* lib_path = std::getenv("TCIM_LIBRARY_PATH");                                                   // JingliangGao 2026/06/27
+    if (!lib_path) {                                                                                          // JingliangGao 2026/06/27
 #ifdef _WIN32
         lib_path = "tcim_c_api_bridge.dll";
-#else
-        lib_path = "/usr/local/houmo/lib/libtcim_runtime_c_api.so";
+#else                                                                                                         // JingliangGao 2026/06/27
+        if (access("/opt/system/lib/xpu/houmo/libtcim_runtime_c_api.so", F_OK) == 0) {                        // JingliangGao 2026/06/27
+            lib_path = "/opt/system/lib/xpu/houmo/libtcim_runtime_c_api.so";                                  // JingliangGao 2026/06/27
+        } else if (access("/usr/lib/xpu/houmo/libtcim_runtime_c_api.so", F_OK) == 0) {                        // JingliangGao 2026/06/27
+            lib_path = "/usr/lib/xpu/houmo/libtcim_runtime_c_api.so";                                        // JingliangGao 2026/06/27
+        } else {                                                                                              // JingliangGao 2026/06/27
+            lib_path = "libtcim_runtime_c_api.so";                                                             // JingliangGao 2026/06/27
+        }                                                                                                     // JingliangGao 2026/06/27
 #endif
     }
 
