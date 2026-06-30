@@ -24,7 +24,8 @@ if [ ${BACKEND} == "cpu" ]; then
         -DLLAMA_UNIFY_PROFILER=ON
 elif [ ${BACKEND} == "cuda" ]; then
     cmake .. \
-        -DGGML_CUDA=ON
+        -DGGML_CUDA=ON \
+        -DLLAMA_UNIFY_PROFILER=ON
 fi
 
 # build project
