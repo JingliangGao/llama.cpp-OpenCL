@@ -725,11 +725,7 @@ struct common_params {
     void *                  load_progress_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
 
-<<<<<<< Updated upstream
-#if defined(LLAMA_UNIFY_PROFILER)
-=======
-#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
->>>>>>> Stashed changes
+#ifdef GGML_UNIFY_PROFILER
     /* insert unify profiler params here     JingliangGao 2026/06/22 */
     // unify profiler params
     bool        with_backends    = false;  // export graph ops with backend assignments

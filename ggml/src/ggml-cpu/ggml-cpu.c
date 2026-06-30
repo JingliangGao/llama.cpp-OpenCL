@@ -9,7 +9,7 @@
 #include "quants.h"
 #include "ggml-threading.h"
 
-#if defined(GGML_UNIFY_PROFILER) 
+#if defined(GGML_UNIFY_PROFILER)
 #include "ggml-profiler.h"    /* add profiler header   JingliangGao 2026/06/24 */
 #endif
 
@@ -3048,8 +3048,40 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
-#ifdef GGML_UNIFY_PROFILER
-    /* Profiling state    JingliangGao 2026/06/24 */
+#ifndef GGML_UNIFY_PROFILER
+    for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
+        struct ggml_tensor * node = cgraph->nodes[node_n];
+
+        if (ggml_op_is_empty(node->op)) {
+            // skip NOPs
+            continue;
+        }
+
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+        // Try fused ops, fall back to normal compute
+        const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+        if (n_fused > 0) {
+            node_n += n_fused;
+        } else {
+            ggml_compute_forward(&params, node);
+        }
+
+        if (state->ith == 0 && cplan->abort_callback &&
+                cplan->abort_callback(cplan->abort_callback_data)) {
+            atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
+            tp->ec    = GGML_STATUS_ABORTED;
+        }
+
+        if (node_n + 1 < cgraph->n_nodes) {
+            ggml_barrier(state->threadpool);
+        }
+    }
+#else
+    /* add Profiling state JingliangGao 2026/06/30 */
     if (cplan->profiling_context != NULL && cplan->profiling_record_fn != NULL) {
         for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
             struct ggml_tensor * node = cgraph->nodes[node_n];
@@ -3068,53 +3100,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 t_start = ggml_profiler_time_ns();
             }
 
-<<<<<<< Updated upstream
-#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
-        // Per-node profiling: record timing on thread 0 only
-        uint64_t prof_start_ns = 0;
-        if (state->ith == 0 && cplan->profiling_record_fn) {
-            struct timespec ts;
-            clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-            prof_start_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-        }
-#endif
-
-        // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
-        // Try fused ops, fall back to normal compute
-        const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
-        if (n_fused > 0) {
-            node_n += n_fused;
-        } else {
-=======
->>>>>>> Stashed changes
             ggml_compute_forward(&params, node);
 
-<<<<<<< Updated upstream
-#if defined(GGML_UNIFY_PROFILER) /* JingliangGao 2026/06/24 */
-        if (state->ith == 0 && cplan->profiling_record_fn) {
-            struct timespec ts;
-            clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-            uint64_t prof_end_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-            uint64_t bytes = ggml_nbytes(node);
-            cplan->profiling_record_fn(
-                cplan->profiling_context,
-                (int)GGML_PROFILE_EVENT_OP,
-                ggml_op_name(node->op),
-                0, // split_id
-                prof_start_ns,
-                prof_end_ns,
-                bytes,
-                NULL, // extra
-                node
-            );
-        }
-#endif
-
-        if (state->ith == 0 && cplan->abort_callback &&
-                cplan->abort_callback(cplan->abort_callback_data)) {
-            atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
-            tp->ec    = GGML_STATUS_ABORTED;
-=======
             if (node_n + 1 < cgraph->n_nodes) {
                 ggml_barrier(state->threadpool);
             }
@@ -3130,10 +3117,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
                 tp->ec = GGML_STATUS_ABORTED;
             }
->>>>>>> Stashed changes
         }
     } else {
-#endif
         for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
             struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3146,14 +3131,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 continue;
             }
 
-            // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
-            // Try fused ops, fall back to normal compute
-            const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
-            if (n_fused > 0) {
-                node_n += n_fused;
-            } else {
-                ggml_compute_forward(&params, node);
-            }
+        // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+        // Try fused ops, fall back to normal compute
+        const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+        if (n_fused > 0) {
+            node_n += n_fused;
+        } else {
+            ggml_compute_forward(&params, node);
+        }
 
             if (state->ith == 0 && cplan->abort_callback &&
                     cplan->abort_callback(cplan->abort_callback_data)) {
@@ -3165,10 +3150,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 ggml_barrier(state->threadpool);
             }
         }
-#if defined(GGML_UNIFY_PROFILER)
     }
 #endif
-
 
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p\n", state->ith, (const void *)cplan);
