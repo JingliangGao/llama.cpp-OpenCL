@@ -15,10 +15,10 @@ chmod +x build-for-debug.sh && build-for-debug.sh
 
 | 后端 | 状态 | 计时方法 |
 |---------|--------|---------------|
-| CPU     | 已支持 | 墙上时钟 (`CLOCK_MONOTONIC_RAW`) |
+| CPU     | 已支持 | Wall-clock  (`CLOCK_MONOTONIC_RAW`) |
 | CUDA    | 已支持 | `cudaEvent` GPU 时间戳 |
 | Vulkan  | 已支持 | GPU 时间戳查询 |
-| BLAS    | 已支持 | 墙上时钟 |
+| BLAS    | 已支持 | Wall-clock  |
 | Metal   | 暂不支持 | — |
 | OpenCL  | 暂不支持 | — |
 
