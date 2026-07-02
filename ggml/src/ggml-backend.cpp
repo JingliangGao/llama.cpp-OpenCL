@@ -2805,8 +2805,8 @@ int ggml_backend_sched_write_profiling_json(ggml_backend_sched_t sched, FILE * f
     }
 
     fprintf(fp, "{\n");
-    fprintf(fp, "  \"version\": 3,\n");
-    fprintf(fp, "  \"profiler\": \"ggml\",\n");
+    fprintf(fp, "  \"version\": \"%s\",\n", GGML_PROFILER_VERSION);
+    fprintf(fp, "  \"profiler\": \"%s\",\n", GGML_PROFILER_NAME);
     fprintf(fp, "  \"total_records\": %d,\n", (int) sched->profiling_records.size());
     fprintf(fp, "  \"total_ns\": %llu,\n", (unsigned long long) total_ns);
 

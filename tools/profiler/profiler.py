@@ -340,8 +340,8 @@ class ProfileData:
         with open(filepath, "r") as f:
             data = json.load(f)
 
-        if data.get("profiler") != "ggml":
-            print(f"Warning: file may not be a ggml profiler output (profiler={data.get('profiler')})")
+        if data.get("profiler") != "kylin profiler":
+            print(f"Warning: file may not be a kylin profiler output (profiler={data.get('profiler')})")
 
         records = []
         def _pad_ne(v):
@@ -509,7 +509,7 @@ class ProfileData:
     def summary(self) -> None:
         """Print a formatted summary table to stdout."""
         print(f"\n{'='*80}")
-        print(f"  ggml Profiler Summary")
+        print(f"  Kylin Profiler Summary")
         print(f"{'='*80}")
         print(f"  Total records: {len(self.records)}")
         print(f"  Total time:    {self.total_ms:.2f} ms")
@@ -803,7 +803,7 @@ class ProfileData:
         # --- HTML ---
         html = (
             '<!DOCTYPE html>\n<html><head><meta charset="utf-8">'
-            '<title>ggml Profiler</title>\n<style>\n'
+            '<title>Kylin Profiler</title>\n<style>\n'
             '*{margin:0;padding:0;box-sizing:border-box}\n'
             'body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;'
             'display:flex;flex-direction:column;height:100vh;overflow:hidden}\n'
@@ -844,7 +844,7 @@ class ProfileData:
             '#lg{background:#16213e;padding:6px 16px;border-top:1px solid #0f3460;'
             'font-size:10px;flex-shrink:0}\n'
             '</style></head><body>\n'
-            '<div id="hd"><h1>ggml Profiler Timeline</h1>'
+            '<div id="hd"><h1>Kylin Profiler Timeline</h1>'
             '<span class="st">' + header_stats + '</span></div>\n'
             '<div id="tb">'
             '<button onclick="fitAll()">Fit</button>'

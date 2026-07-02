@@ -5,6 +5,9 @@
 
 #include <stdint.h>
 
+const char * const GGML_PROFILER_NAME = "kylin profiler";
+const char * const GGML_PROFILER_VERSION = "1.0";
+
 #ifdef __cplusplus
 extern "C" {
 #endif
